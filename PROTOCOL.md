@@ -1,153 +1,151 @@
-# AULA S75Pro — Protocol Notes
+# AULA S75 Pro — USB RGB Protocol (reverse-engineered)
 
-Built from: `config.xml`, `rgb-keyboard.xml`, `decomiledFromExe.txt` (Ghidra decompile of
-the Windows driver), and two tshark captures (`KeyResponseTimeLogs.txt`, `TimeToSleepLogs.txt`).
+Reverse-engineered control protocol for the AULA S75 Pro (VID `0x0C45`, PID `0x800A`,
+wired USB mode). Built from Wireshark/usbmon captures of the official Windows driver
+(running under Wine), the driver's Ghidra decompilation, the keyboard MCU firmware
+(v1.03), and SignalRGB's official SONIX integration. Everything in the "verified"
+sections was confirmed on real hardware unless marked otherwise.
 
 ## 1. Transport
 
-| Item | Value |
-|---|---|
-| VID | `0x0C45` |
-| PID (wired USB) | `0x800A`, HID interface `MI_00` (interface 0) |
-| PID (2.4G dongle) | `0xFEFE`, HID interface `MI_03` (interface 3) |
-| Report type | **Feature Report**, Report ID `0x00` |
-| Report size | 64 bytes of payload (`wLength = 0x40`) |
-| Write | `SET_REPORT`: bmRequestType `0x21`, bRequest `0x09`, wValue `0x0300`, wIndex=interface |
-| Read | `GET_REPORT`: bmRequestType `0xA1`, bRequest `0x01`, same wValue/wIndex/wLength |
-
-Confirmed directly from the two provided pcaps (control transfer setup packets `09 00 03
-03 00 40 00 ...` = bRequest=SET_REPORT(9), wValue=0x0300, wIndex=0x0003, wLength=0x0040).
-
-Every 64-byte payload begins with a **little-endian 16-bit command word**
-(`byte[0]` = low byte, `byte[1]` = high byte). E.g. command `0x1804` is transmitted
-as bytes `04 18 ...`.
-
-## 2. The write/commit pattern
-
-Nearly every settings-writing function in the decompiled driver follows the same shape:
+All control reports are 64-byte HID **feature reports** on **interface 3**
+(usage page `0xFF13`, usage `0x0001`):
 
 ```
-SET  cmd 0x1804                       -- "open" / begin
-GET  (ack, echoes similar data)
-SET  cmd 0x1704  body=[01 00 00 00 00 01]   -- fixed probe/ack (always this exact body)
-GET  (ack)
-SET  cmd <the actual data for this feature>
-SET  cmd 0x0204                       -- commit / select page for read-back
-GET  <page 0x0204 response - used to confirm the write>
-[SET cmd 0xF004]                      -- "finalize", seen on some (bulkier) writes
+bmRequestType 0x21 | bRequest 0x09 (SET_REPORT) | wValue 0x0300 | wIndex 0x0003 | 64 bytes
 ```
 
-This was verified byte-for-byte for the "general settings" write (see §3). The
-lighting/macro functions in the decompile follow the same skeleton but with a
-different payload in the middle (see §4, unverified).
+Report ID 0; the 64-byte payload follows. hidapi: `send_feature_report(b"\x00" + payload)`.
+Interface 0 also answers some commands, but interface 3 is the vendor interface the
+official software and SignalRGB use — use it.
 
-## 3. VERIFIED: General settings write (fn-switch / sleep-timer / key-response-time)
+## 2. Transaction model (page probes)
 
-Decompiled source: `FUN_004141a0` (matches `<function fn_layer="1" sleep_time="1"
-key_respondtime="1" />` in `rgb-keyboard.xml` — this is the settings panel with those
-three controls).
+Most operations follow: **open -> page-probe -> payload-write -> commit -> (finalize)**.
+The probe selects which page a following `00 01` write lands on:
 
-Command `0x0100` payload layout (all offsets are payload-byte indices, 0-based):
-
-| Byte(s) | Meaning | Observed in captures |
+| Report prefix | Command | Purpose |
 |---|---|---|
-| 0-1 | command word `0x0100` (LE: `00 01`) | always `00 01` |
-| 2 | "fn layer" checkbox enabled (0/1) | always `0` |
-| 3 | "sleep timer" checkbox enabled (0/1) | always `0` |
-| 4 | "key response" checkbox enabled (0/1) | always `0` |
-| 5 | fn_switch value | always `0` in both logs (untouched) |
-| 6 | sleep_time value | varies: `1`, `2`, `3` — dropdown confirmed as Never=`0`, 1 min=`1`, 5 min=`2`, (30 min=`3`, unconfirmed) |
-| 7 | *(unused/padding)* | always `0` |
-| 8 | key_response_time value | varies: `1`, `2`, `3` |
-| 9-61 | padding | `0` |
-| 62-63 | trailer `0xAA 0x55` | always present |
+| `04 18` | 0x1804 | open / begin transaction |
+| `04 13` | 0x1304 | probe: lighting/settings page |
+| `04 23` | 0x2304 | probe: custom-light table page (`payload[8]=9` for RGB keyboards) |
+| `04 28` | 0x2804 | probe: RTC page |
+| `00 01 <body> … aa 55` | 0x0100 | page write (trailer `AA 55` on the 64-byte buffer) |
+| `04 02` | 0x0204 | commit |
+| `04 f0` | 0xF004 | finalize (ends custom-table apply transactions) |
+| `04 f5` | 0x04F5 | read current table back (`payload[8]=9` for RGB) |
 
-The 3 "checkbox enabled" bytes never got set to 1 in either capture (the user never
-toggled those specific checkboxes while testing the sliders/dropdowns), so we can't
-100% confirm they're required — captures show the write succeeds with them at 0.
+Settings transactions use ~36 ms per step (the driver's `cmd_delaytime=35` from
+`config.xml`). ACKs/status arrive via GET_REPORT: the device echoes the command word
+with a status-style byte (`… 00 01 …` = OK in most captures).
 
-### Per-profile writes
+## 3. Lighting effects (0x1304 page)
 
-The device stores these settings **per profile** (0 = wired, 1 = wireless) — the
-`0x1704` probe's 2nd byte is a profile selector. To make a setting stick
-regardless of which mode the keyboard is currently in, the whole
-open→probe→write→commit sequence must be repeated once per profile.
-`write_general_settings()` does this automatically (loops `profile_index in (0, 1)`).
+Write payload (64 bytes): `[effect, r, g, b, 0,0,0,0, option, brightness, speed,
+direction, 0,0, aa, 55]`. Effects `0x00–0x13`: off, static, single_on, single_off,
+glittering, fluttering, colourful, breath, spectrum, outward, scrolling, rolling,
+rotating, explode, launch, ripples, flowing, pulsating, tilt, shuttle. Verified
+against per-effect captures.
 
-### What we could NOT fully pin down
+Quirks:
+- **Effect byte `0x00` reloads the stored config from flash** — the board re-runs the
+  saved effect. It is NOT "custom mode".
+- Effect byte `0x14` is rejected by the dispatcher (not `< 0x14`) — a silent no-op.
+- Internal mode `0x14` (= factory default, "custom light") is selected by host bytes
+  `0x00`/`0x80` per the firmware's command-5 mapping, but see the note above — from
+  the USB side, `0x00` behaves as reload-stored.
 
-After the commit (`0x0204`), the device responds with a report whose **byte 4** was,
-in *every single one* of the 6 capture sessions across both files, exactly equal to:
+## 4. Streaming (0x2004) — the live per-key path — VERIFIED
+
+This is the dynamic RGB path used by the driver's "music rhythm" mode and SignalRGB.
+Frames are pushed in full, repeatedly; the MCU renders the RAM tables as-is. No mode
+entry, no handshake — it renders from **any** board state, even on top of running
+hardware animations.
+
+### Per-frame sequence (order and timing both matter)
 
 ```
-response[4] == (fn_switch_value + sleep_time_value + key_response_time_value) & 0xFF
+1. SET  04 20 00 00 00 00 00 00 08            (frame header; payload[8] = 8 for RGB,
+                                                3 for non-RGB keyboards)
+2. wait ~6-10 ms, then GET_REPORT              (*** REQUIRED — see discoveries ***)
+3. SET  8 x 64-byte raw reports, ~2-3.3 ms apart:
+        each = 16 x [light_index, R, G, B]    (key slot order = rgb-keyboard.xml
+        DOCUMENT ORDER; pad with zeros to fill 128 slots / 8 packets)
+4. SET  one all-zero 64-byte report
+5. SET  04 02 00 …                            (commit)
+6. wait ~6-10 ms, then GET_REPORT              (*** REQUIRED ***)
 ```
 
-This held even when the individual `sleep_time`/`key_response_time` values sent were
-identical between two sessions but arrived at the same sum via different splits. That
-strongly suggests **this response byte is a write-acknowledgement checksum**, not a
-literal echo of "the key response time," so it should not be read as a settings query.
-The tool's `write_general_settings(verify=True)` uses this as a sanity check.
+The two GETs are **mandatory handshakes**, not status polls: the identical byte
+sequence without them renders nothing in any board state (fresh power-cycle included);
+with them it renders reliably. A feature GET returns the device's current report
+buffer immediately — the wait is MCU processing time, not I/O, so do not replace the
+sleep with a "blocking read".
 
-We could **not** determine the human-meaning of the raw level values (e.g. does
-`key_response_time=3` mean "3 ms", "level 3 of N", or something else) — the official
-driver UI wasn't available to us, only the raw wire traffic. Cross-check the actual
-slider/dropdown positions in your AULA driver against what gets sent (use
-`raw-get`/Wireshark side-by-side) to build your own value table.
+### Key layout
 
-## 4. INFERRED / UNVERIFIED: Per-key custom lighting
+80 keys; slot i of the frame corresponds to the i-th `<key>` in `rgb-keyboard.xml`
+(document order), addressed by its `light_index`. (Sorting by `light_index` also works
+for this board since key_index == light_index in the XML, but document order is what
+the wire format specifies.)
 
-No lighting traffic was captured (the two provided logs only cover the settings
-above), so this section is built purely from reading the decompiled code
-(`FUN_0044b900` write / `FUN_0042adb0` read) and should be treated as a hypothesis,
-not fact:
+### Timing reference (measured)
 
-- Write command family `0x23xx`, e.g. `0x2304`, with a "mode" byte — `3` for basic
-  on/off lighting, `9` for full RGB (matches `light rgb_keyboard="1"` in the XML).
-- Followed by a big table of per-key entries **indexed by each key's `light_index`**
-  attribute (see `rgb-keyboard.xml` — every key has a unique `light_index` 1-120).
-  - Basic mode: 1 byte per key (`0xFF` = on, `0x00` = off) → table size ~0xC0 (192) bytes
-  - RGB mode: 4 bytes per key (`[type, R, G, B]`) → table size ~0x240 (576) bytes
-  - `type` byte guessed as `2` for "static color" based on a parallel table in the
-    decompile that maps effect-type indices to type codes (`1`=off, `2`=static,
-    `3`=breathing, etc. — see the big `if/else` chain in `FUN_00418550`).
-  - Because a single feature report only carries 64 bytes, the real driver must
-    split this table across several reports — the exact chunk headers were not
-    observed, so `ExperimentalLighting.apply_colors()` currently just sends raw
-    64-byte slices with no extra per-chunk framing. **This is the most likely part
-    to be wrong** — verify with your own capture.
-- Read-back command `0x04F5` for fetching the currently stored light table.
-- Ends with `0x0204` (commit) then `0xF004` (finalize), same as other writes.
+| quantity | observed floor | official driver | shipped default |
+|---|---|---|---|
+| header/commit -> GET | ≤ 3 ms | ~6 ms | **10 ms** (margin over both) |
+| chunk -> chunk | ≤ 1-2 ms (load-tested) | ~3.2 ms | **2 ms** |
+| full frame | — | ~60 ms (~8-21 fps, beat-driven) | ~36 ms (~28 fps) |
 
-### Macro / key remap (also unverified)
+~15-20 fps is perceptually smooth for lighting; 20-30 fps for reactive effects.
+Event-type effects (alerts) care about latency (<100-200 ms), not rate.
 
-`FUN_00418550` shows a page-select word that depends on connection mode:
-`CONCAT(mode_byte, 0x04)` where `mode_byte = 0x27` in 2.4G mode vs `0x11` in wired
-mode (i.e. commands `0x2704` / `0x1104`). Each remapped key becomes a small tagged
-record (type + up to 3 payload bytes) — types seen in the decompile:
+## 5. Custom-light table (0x2304) — the "save" path
 
-| type | meaning (guessed) |
-|---|---|
-| 1 | (0-length marker / disabled?) |
-| 2 | multimedia/consumer key (2-byte HID usage) |
-| 3 | mouse button |
-| 6 | modifier + keycode combo |
-| 7 | plain keyboard key + modifier |
-| 0xd | 3-byte custom payload |
+`04 18` -> `04 23 … 09` -> table (`[idx,r,g,b]` entries, `AA 55` trailer, 576 bytes
+total for RGB) -> `04 02` -> `04 f0`. This **writes the stored config (flash)** —
+slow, wears flash, and re-applies with a visible reload. Use it for static layouts
+only; never for dynamic content (that's what 0x2004 is for).
 
-This table is incomplete — treat it as a starting point for your own capture-driven
-reverse engineering, not a finished spec.
+## 6. RTC sync (0x2804 page) — VERIFIED
 
-## 5. How to extend this yourself
+`04 18` -> `04 28 00 00 00 00 01` -> `00 01 5a yy mm dd HH MM SS 00 wd … aa 55`
+-> `04 02`. Body decodes as `[0x5A, year-2000, month, day, hour, minute, second,
+0x00, weekday(Sun=0)]`. The driver's UI syncs the keyboard clock with this whenever a
+page is opened. Note: the commit status byte does NOT mean accepted/rejected here —
+the clock applies even when it reads 0.
 
-See `CAPTURING.md` for how to record more traffic (lighting, macros, firmware
-version query, etc.) and feed it back into this tool. The general workflow that
-worked for the two settings we did verify:
+## 7. Hard-won discoveries (read before modifying the code)
 
-1. Capture a `tshark`/Wireshark USB trace while changing **one thing at a time** in
-   the official driver.
-2. Filter to `usb.bus_id == X && usb.device_address == Y` for the keyboard.
-3. Diff the SET_REPORT payloads between two captures that differ by exactly one
-   setting value — the byte(s) that change are your answer.
-4. Cross-check with the matching function in `decomiledFromExe.txt` to understand
-   *why* that byte is there (variable name, surrounding checkbox/dropdown logic).
+1. **The GETs gate the frame.** Discovered after a week of failed replays; every
+   analysis pass (frame format, interfaces, cadence, modes) was correct — the missing
+   piece was treating the driver's status polls as part of the frame.
+2. **Ghidra's auto-analysis misses Keil `switch8` jump-table functions** (the mode/arm
+   dispatchers and several table writers are absent from the exported `.c`). If a
+   function seems missing, search the raw binary (function-start patterns, or the
+   byte-tables the switches index) rather than trusting the decompile.
+3. The **in-firmware consumer of 0x2004 frames was never located by static analysis**
+   (likely ROM-resident or in un-decompiled code). The per-frame sequence in section 4
+   is hardware-verified end-to-end; treat it as the specification.
+4. SignalRGB officially supports the S75 Pro (`SONIX_Keyboard_Controller_2.js`,
+   layout "S75 Pro") and uses the same 0x2004 sequence with the same GETs — good
+   independent confirmation.
+
+## 8. Provenance
+
+- `musicRGB.pcapng` / `musicRGB2.pcapng` — official driver streaming (device 58 / 26).
+- `escToRed.pcapng`, `UserLightning-singleKeyChange.pcapng` — custom-light apply.
+- `Static.pcapng` + `effects/*.pcapng` (20 effect captures) — lighting writes & readback.
+- `DeviceDriver.exe.c` — Ghidra decompile of the official software (frame senders
+  `FUN_00427f60`/`FUN_004328c0`; effect apply `FUN_00434980`; capability flag `0x7ac`
+  = XML `rgb_keyboard`).
+- `s75pro_fw_v1.03.bin` — keyboard MCU firmware (Sonix); the running firmware is
+  byte-identical to a file distributed as "1.20" (regional naming).
+- `SONIX_Keyboard_Controller_2.js` — SignalRGB's official integration.
+
+## 9. Safety notes
+
+- Streaming writes RAM only — no flash wear; safe for 24/7 use.
+- The 0x2304 save path writes flash; keep it for occasional static layouts.
+- Avoid full-brightness strobing in the 5-20 Hz range (photosensitivity); breathing
+  (period >= 1 s) is the safe idiom for alerts.
