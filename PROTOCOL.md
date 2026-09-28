@@ -3,7 +3,7 @@
 Reverse-engineered control protocol for the AULA S75 Pro (VID `0x0C45`, PID `0x800A`,
 wired USB mode). Built from Wireshark/usbmon captures of the official Windows driver
 (running under Wine), the driver's Ghidra decompilation, the keyboard MCU firmware
-(v1.03), and SignalRGB's official SONIX integration. Everything in the "verified"
+(v1.03). Everything in the "verified"
 sections was confirmed on real hardware unless marked otherwise.
 
 ## 1. Transport
@@ -17,7 +17,7 @@ bmRequestType 0x21 | bRequest 0x09 (SET_REPORT) | wValue 0x0300 | wIndex 0x0003 
 
 Report ID 0; the 64-byte payload follows. hidapi: `send_feature_report(b"\x00" + payload)`.
 Interface 0 also answers some commands, but interface 3 is the vendor interface the
-official software and SignalRGB use — use it.
+official software use it.
 
 ## 2. Transaction model (page probes)
 
@@ -57,7 +57,7 @@ Quirks:
 
 ## 4. Streaming (0x2004) — the live per-key path — VERIFIED
 
-This is the dynamic RGB path used by the driver's "music rhythm" mode and SignalRGB.
+This is the dynamic RGB path used by the driver's "music rhythm" mode.
 Frames are pushed in full, repeatedly; the MCU renders the RAM tables as-is. No mode
 entry, no handshake — it renders from **any** board state, even on top of running
 hardware animations.
@@ -127,9 +127,6 @@ the clock applies even when it reads 0.
 3. The **in-firmware consumer of 0x2004 frames was never located by static analysis**
    (likely ROM-resident or in un-decompiled code). The per-frame sequence in section 4
    is hardware-verified end-to-end; treat it as the specification.
-4. SignalRGB officially supports the S75 Pro (`SONIX_Keyboard_Controller_2.js`,
-   layout "S75 Pro") and uses the same 0x2004 sequence with the same GETs — good
-   independent confirmation.
 
 ## 8. Provenance
 
@@ -141,7 +138,6 @@ the clock applies even when it reads 0.
   = XML `rgb_keyboard`).
 - `s75pro_fw_v1.03.bin` — keyboard MCU firmware (Sonix); the running firmware is
   byte-identical to a file distributed as "1.20" (regional naming).
-- `SONIX_Keyboard_Controller_2.js` — SignalRGB's official integration.
 
 ## 9. Safety notes
 

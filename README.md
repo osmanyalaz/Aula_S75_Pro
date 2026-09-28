@@ -21,4 +21,4 @@ See [PROTOCOL.md](PROTOCOL.md) for the full reverse-engineered protocol.
 
 ## Credits
 Reverse-engineered from USB captures of the official driver, its decompilation,
-the keyboard MCU firmware, and SignalRGB's SONIX integration.
+the keyboard MCU firmware.
