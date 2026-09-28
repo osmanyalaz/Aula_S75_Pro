@@ -82,6 +82,8 @@ with them it renders reliably. A feature GET returns the device's current report
 buffer immediately — the wait is MCU processing time, not I/O, so do not replace the
 sleep with a "blocking read".
 
+Re-confirmed by negative test (2026-09-28): a stripped sequence (no GETs, no zero report, no chunk delays) rendered nothing even in a warm session immediately after full handshake frames had been running — the GETs are per-frame mandatory, not session priming.
+
 ### Key layout
 
 80 keys; slot i of the frame corresponds to the i-th `<key>` in `rgb-keyboard.xml`

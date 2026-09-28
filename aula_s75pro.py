@@ -385,7 +385,6 @@ class AulaS75Pro:
             00 01 5a <timestamp> ... aa 55
             04 02                      commit
         Cadence matters: ~36 ms SET->GET, ONE status GET per SET.
-        Raises RuntimeError if the board rejects the sync.
         """
         from datetime import datetime
         t = when or datetime.now()
