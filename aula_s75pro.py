@@ -374,9 +374,10 @@ class AulaS75Pro:
         the keyboard clock this way. The 0x2804 probe selects the RTC page,
         like 0x1304 selects the lighting page and 0x1704 the settings page.
 
-        The board REJECTS stale timestamps (commit status 0 - replaying the
-        capture's Sep-17 timestamp on Sep-21 failed exactly this way), so
-        the time always comes from the PC clock. Pass `when` only for tests.
+        The commit status byte does NOT indicate accepted/rejected: a status of 0
+        was once read as a "rejection" (replaying the capture's stale Sep-17
+        timestamp), but the TFT clock advanced anyway. The write applies
+        regardless, so this only warns instead of raising. Pass `when` for tests.
 
         Wire sequence (either interface works; the capture used 3):
             04 18                      open

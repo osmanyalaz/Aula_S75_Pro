@@ -10,7 +10,7 @@ Protocol notes (verified):
   * header payload[3] is 0 on every frame - there is no arm packet and
     no per-frame counter; earlier theories of both were artifacts of
     reading GET_REPORT replies as SET headers.
-  * ~3.3 ms between chunk SETs in the capture; no ACK reads needed.
+  * ~3.3 ms between chunk SETs in the capture.
   * key slot order = rgb-keyboard.xml document order.
 """
 

@@ -146,12 +146,6 @@ def main():
     parser_color.add_argument('--opt', type=int, default=0, help='Option flag (1=Rainbow/Cycle, 0=Solid)')
     parser_color.set_defaults(func=cmd_set_color)
 
-    parser_key = sub.add_parser('keycolor', help='Set single key color')
-    parser_key.add_argument('key', type=str, help='Key name (e.g. Esc, A, Enter, Space)')
-    parser_key.add_argument('r', type=int)
-    parser_key.add_argument('g', type=int)
-    parser_key.add_argument('b', type=int)
-
     sub.add_parser("sync-clock", help="sync keyboard RTC to PC time").set_defaults(func=cmd_sync_clock)
 
     args = p.parse_args()
