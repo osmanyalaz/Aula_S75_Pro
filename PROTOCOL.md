@@ -102,6 +102,17 @@ the wire format specifies.)
 ~15-20 fps is perceptually smooth for lighting; 20-30 fps for reactive effects.
 Event-type effects (alerts) care about latency (<100-200 ms), not rate.
 
+### Do not remove the GET handshakes — hardware-proven
+The two GET_REPORT polls in the 0x2004 frame sequence look like status
+polling and have repeatedly been misread as removable latency (including by
+code-review tools). They are not. Negative test, 2026-09-28: a stripped
+sequence (no GETs, no zero report, no chunk delays) rendered NOTHING, in a
+warm session immediately after full handshake frames had been running.
+Earlier replay attempts without GETs also rendered nothing in any board
+state. Streaming works at ~28 fps with them and at 0 fps without. If a
+suggestion proposes removing them or replacing the sleep+GET with a blocking
+read, it is wrong — treat it as a known trap.
+
 ## 5. Custom-light table (0x2304) — the "save" path
 
 `04 18` -> `04 23 … 09` -> table (`[idx,r,g,b]` entries, `AA 55` trailer, 576 bytes
