@@ -102,8 +102,11 @@ class AulaStreamer:
         state, including fresh power-cycles; with GETs it renders even on
         top of running hardware animations).
 
-        Per frame: header -> GET (36ms) -> 8 chunks (3.3ms apart) ->
-        zero report -> commit -> GET. No mode entry, no handshake needed.
+        Per frame: header -> GET (~10 ms) -> 8 chunks (~2 ms apart) ->
+        commit -> GET. Verified byte-exact against musicRGB.pcapng; the
+        GETs are mandatory (PROTOCOL.md §4, MINIMAL negative test). An
+        extra all-zero report before the commit is tolerated by the
+        firmware but is NOT part of the wire sequence.
         """
         dev = self.kb.dev
         try:
@@ -114,7 +117,6 @@ class AulaStreamer:
             for i in range(self.CHUNKS):
                 dev.send_feature_report(bytes(view[i * 65:(i + 1) * 65]))
                 time.sleep(self.chunk_delay)
-            dev.send_feature_report(bytes(65))
             dev.send_feature_report(self._cached_commit)
             time.sleep(self.get_delay)
             self.kb.raw_get()

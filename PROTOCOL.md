@@ -39,6 +39,18 @@ Settings transactions use ~36 ms per step (the driver's `cmd_delaytime=35` from
 `config.xml`). ACKs/status arrive via GET_REPORT: the device echoes the command word
 with a status-style byte (`… 00 01 …` = OK in most captures).
 
+**Status-byte semantics (refined 2026-09-29, RTC page, likely general):** the
+status-style byte is a *well-formedness* indicator, not an apply
+acknowledgement. `0x01` = the transaction was well-formed (probe parameter at
+payload[8], body where the page expects it). `0x00` — or an all-zeros status
+buffer — means malformed/unparsed, and crucially **never means "rejected":
+the preceding write may still have applied.** Verify by effect, not by
+status. Evidence: the RTC page accepts any timestamp including years in the
+past (a 2020 date visibly set the clock); lighting writes whose commit read
+`0x00` were later found to have applied anyway. An all-zeros status buffer
+during commit polling has also been seen when the MCU was busy with flash
+housekeeping — patience and retry, not abandonment.
+
 ## 3. Lighting effects (0x1304 page)
 
 Write payload (64 bytes): `[effect, r, g, b, 0,0,0,0, option, brightness, speed,
@@ -71,10 +83,13 @@ hardware animations.
 3. SET  8 x 64-byte raw reports, ~2-3.3 ms apart:
         each = 16 x [light_index, R, G, B]    (key slot order = rgb-keyboard.xml
         DOCUMENT ORDER; pad with zeros to fill 128 slots / 8 packets)
-4. SET  one all-zero 64-byte report
-5. SET  04 02 00 …                            (commit)
-6. wait ~6-10 ms, then GET_REPORT              (*** REQUIRED ***)
+4. SET  04 02 00 …                            (commit)
+5. wait ~6-10 ms, then GET_REPORT              (*** REQUIRED ***)
 ```
+
+Early versions inserted an extra all-zero report between the last chunk and
+the commit; it is tolerated by the firmware but does not appear in captures.
+Removed 2026-09-29 after an isolation test confirmed rendering is unaffected.
 
 The two GETs are **mandatory handshakes**, not status polls: the identical byte
 sequence without them renders nothing in any board state (fresh power-cycle included);
@@ -125,8 +140,17 @@ only; never for dynamic content (that's what 0x2004 is for).
 `04 18` -> `04 28 00 00 00 00 01` -> `00 01 5a yy mm dd HH MM SS 00 wd … aa 55`
 -> `04 02`. Body decodes as `[0x5A, year-2000, month, day, hour, minute, second,
 0x00, weekday(Sun=0)]`. The driver's UI syncs the keyboard clock with this whenever a
-page is opened. Note: the commit status byte does NOT mean accepted/rejected here —
-the clock applies even when it reads 0.
+page is opened. Note: ~~the commit status byte does NOT mean accepted/rejected here —
+the clock applies even when it reads 0.~~
+
+Note (revised 2026-09-29): the commit status byte is a well-formedness
+indicator, not accepted/rejected. With the corrected page probe
+(`04 28 00 00 00 00 00 00 01` — parameter at payload[8], like every other
+page probe) the status reads `0x01`. The old `04 28 00 00 00 00 01`
+(parameter at payload[6]) produced `0x00` while the write still applied — a
+malformed-transaction signal, not a rejection. Stale timestamps are accepted
+unconditionally (verified: 2020-01-01 visibly set the clock), so freshness
+is the host's job.
 
 ## 7. Hard-won discoveries (read before modifying the code)
 
