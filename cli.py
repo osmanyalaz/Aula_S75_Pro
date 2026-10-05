@@ -14,7 +14,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from aula_s75pro import AulaS75Pro, load_keymap, REPORT_LEN, EFFECTS, DIRECTIONS
+from aula_s75pro import AulaS75Pro, load_keymap, REPORT_LEN, EFFECTS, DIRECTIONS, KEYMAP
 
 HERE = Path(__file__).parent
 
@@ -98,7 +98,43 @@ def cmd_set_color(args):
         )
     print(f"Set color to RGB({args.r}, {args.g}, {args.b}) using effect ID {args.effect}")
 
+def cmd_custom_lighting(args):
+    from aula_s75pro import PHYSICAL_INDICES
+
+    if not args.all and not args.keys:
+        print("error: supply either --all or --keys KEY [KEY ...]", file=sys.stderr)
+        sys.exit(1)
+
+    color = (args.r, args.g, args.b)
+
+    if args.all:
+        key_colors = {idx: color for idx in PHYSICAL_INDICES}
+        label = f"all {len(PHYSICAL_INDICES)} keys"
+    else:
+        key_colors = {}
+        unknown = []
+        for name in args.keys:
+            if name in KEYMAP:
+                key_colors[KEYMAP[name]] = color
+            else:
+                unknown.append(name)
+        if unknown:
+            print(
+                f"warning: unknown key name(s) skipped: {', '.join(unknown)}\n"
+                "  Run 'list-keys' to see valid names."
+            )
+        if not key_colors:
+            print("error: no valid keys specified — nothing to do.", file=sys.stderr)
+            sys.exit(1)
+        label = ", ".join(f"{n}({KEYMAP[n]})" for n in args.keys if n in KEYMAP)
+
+    with AulaS75Pro(mode=args.mode) as kb:
+        kb.set_custom_lighting(key_colors, brightness=args.brightness)
+    print(f"Applied RGB{color} to {label}")
+
+
 def cmd_sync_clock(args):
+
     with AulaS75Pro(mode=args.mode) as kb:
         kb.sync_rtc()
     print("Keyboard RTC synced to PC time")
@@ -146,7 +182,33 @@ def main():
     parser_color.add_argument('--opt', type=int, default=0, help='Option flag (1=Rainbow/Cycle, 0=Solid)')
     parser_color.set_defaults(func=cmd_set_color)
 
+    parser_custom = sub.add_parser(
+        'custom',
+        help='Save a per-key colour table to flash (use --keys or --all)',
+        description=(
+            'Write a custom per-key lighting table to flash.  '
+            'Specify individual keys with --keys, or paint every key with --all.  '
+            'Run \'list-keys\' to see all valid key names.'
+        ),
+    )
+    parser_custom.add_argument('r', type=int, help='Red component (0-255)')
+    parser_custom.add_argument('g', type=int, help='Green component (0-255)')
+    parser_custom.add_argument('b', type=int, help='Blue component (0-255)')
+    parser_custom.add_argument(
+        '--keys', nargs='+', metavar='KEY',
+        help='Key names to colour (e.g. --keys Esc W A S D Enter Space)',
+    )
+    parser_custom.add_argument(
+        '--all', action='store_true',
+        help='Apply the colour to every physical key on the board',
+    )
+    parser_custom.add_argument('--brightness', type=int, default=5,
+                               help='Custom-mode brightness (0-5, default 5)')
+    parser_custom.set_defaults(func=cmd_custom_lighting)
+
+
     sub.add_parser("sync-clock", help="sync keyboard RTC to PC time").set_defaults(func=cmd_sync_clock)
+
 
     args = p.parse_args()
     args.func(args)

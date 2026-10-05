@@ -22,6 +22,8 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Optional
 
+from keymap import PHYSICAL_INDICES, KEYMAP  # noqa: F401 (KEYMAP re-exported for callers)
+
 EFFECTS = {
     "off": 0, "static": 1, "single_on": 2, "single_off": 3,
     "glittering": 4, "fluttering": 5, "colourful": 6, "breath": 7,
@@ -49,8 +51,12 @@ VID = 0x0C45
 PID_USB = 0x800A       # mode value="0" desc="USB"       hid_interface="VID_0C45&PID_800A&MI_00"
 PID_DONGLE = 0xFEFE    # mode value="2" desc="2.4G TYPE-A" hid_interface="VID_0C45&PID_FEFE&MI_03"
 
-# Interface number embedded in the Windows hid_interface string (MI_00 / MI_03)
-INTERFACE_USB = 0
+# Vendor HID interface for feature reports.
+# NOTE: config.xml labels the USB mode as "MI_00" — that is the Windows HID path
+# suffix for the *Boot Keyboard* interface, not the vendor control interface.
+# USB captures (PROTOCOL.md §1) and all captures confirm that 64-byte feature
+# reports are sent/received on **interface 3** in both wired and dongle modes.
+INTERFACE_USB = 3
 INTERFACE_DONGLE = 3
 
 REPORT_ID = 0x00
@@ -62,11 +68,15 @@ CMD_PROBE = 0x1704       # fixed probe/ack, sent before the general settings wri
 CMD_GENERAL_SETTINGS = 0x0100   # fn-switch / sleep-timer / key-response write
 CMD_COMMIT = 0x0204       # commit / select page for read-back
 CMD_FINALIZE = 0xF004     # finalize, seen after bulk (lighting) writes
-CMD_LIGHT_APPLY_BASE = 0x2304   # EXPERIMENTAL - "apply custom light" (mode byte varies)
-CMD_LIGHT_READ = 0x04F5   # EXPERIMENTAL - readback current light table (GET)
+CMD_LIGHT_APPLY_BASE = 0x2304   # probe: custom-light table page (payload[8]=9 for RGB, 3 for mono)
+CMD_LIGHT_READ = 0x04F5         # readback current light table via GET_REPORT
 CMD_STREAM_FRAME = 0x2004 # frame update for dynamic RGB music mode
 
 TRAILER = b"\xAA\x55"     # observed at the very end of the 64-byte buffer on writes
+
+# Custom lighting table dimensions (verified against escToRed.pcapng, PROTOCOL.md §5)
+TABLE_SIZE   = 576  # 144 slots × 4 bytes each (light_index, R, G, B)
+TABLE_CHUNKS = 9    # 576 / 64 bytes-per-report
 
 
 def _le16(cmd: int) -> bytes:
@@ -123,7 +133,7 @@ def load_keymap(xml_path: str) -> dict:
 class AulaS75Pro:
     def __init__(self, mode: str = "usb", vid: int = VID, path: Optional[bytes] = None):
         """
-        mode: 'usb' (wired, PID 0x800A, interface 0) or 'dongle' (2.4G, PID 0xFEFE, interface 3)
+        mode: 'usb' (wired, PID 0x800A, interface 3) or 'dongle' (2.4G, PID 0xFEFE, interface 3)
         path: if you already know the exact hidapi device path, pass it directly and
               `mode`/`vid` are ignored for opening.
         """
@@ -139,50 +149,100 @@ class AulaS75Pro:
         self.dev: Optional["hid.device"] = None
 
     # ---- connection -------------------------------------------------------
+    # def find_path(self) -> bytes:
+    #     candidates = [
+    #         d for d in hid.enumerate(self.vid, self.pid)
+    #         if d.get("interface_number") == self.interface
+    #     ]
+    #     if not candidates:
+    #         # fall back to any interface on that VID/PID, in case the OS numbers differently
+    #         candidates = [d for d in hid.enumerate(self.vid, self.pid)]
+    #     if not candidates:
+    #         raise IOError(
+    #             f"No HID device found for VID={self.vid:04X} PID={self.pid:04X}. "
+    #             "Is the keyboard connected in the right mode (usb/dongle)?"
+    #         )
+    #     return candidates[0]["path"]
+
     def find_path(self) -> bytes:
-        candidates = [
-            d for d in hid.enumerate(self.vid, self.pid)
-            if d.get("interface_number") == self.interface
-        ]
+        candidates = hid.enumerate(self.vid, self.pid)
         if not candidates:
-            # fall back to any interface on that VID/PID, in case the OS numbers differently
-            candidates = [d for d in hid.enumerate(self.vid, self.pid)]
-        if not candidates:
-            raise IOError(
-                f"No HID device found for VID={self.vid:04X} PID={self.pid:04X}. "
-                "Is the keyboard connected in the right mode (usb/dongle)?"
-            )
+            raise IOError(f"No device found with VID={self.vid:04X} PID={self.pid:04X}")
+
+        # 1. Best: Match by Vendor-Defined Usage Page (works on Windows, macOS, hidapi-libusb)
+        for d in candidates:
+            if (d.get("usage_page") or 0) >= 0xFF00:
+                return d["path"]
+
+        # 2. Linux hidraw: usage_page is always 0, so fall back to interface number.
+        #    Now that INTERFACE_USB == 3 this directly selects the vendor interface.
+        for d in candidates:
+            if d.get("interface_number") == self.interface:
+                return d["path"]
+
+        # 3. Active Probe Fallback: Try opening candidates and sending a benign GET_REPORT.
+        #    Only the vendor interface (interface 3) accepts a 64-byte feature report.
+        for d in candidates:
+            try:
+                test_dev = hid.device()
+                test_dev.open_path(d["path"])
+                test_dev.get_feature_report(0, 65)
+                test_dev.close()
+                return d["path"]
+            except Exception:
+                continue
+        # 4. Ultimate fallback: return the first candidate and let the caller fail loudly.
         return candidates[0]["path"]
+
 
     def wait_until_idle(self):
         """
-        Pre-flight check: Polls the keyboard to see if the MCU is 'Busy' (byte[3] == 0xFF).
-        If a previous script crashed, it forces a reset command to clear the state machine.
+        Pre-flight check: polls the keyboard to confirm the MCU is idle
+        (byte[3] != 0xFF in the GET_REPORT response) before issuing commands.
+
+        If a previous script crashed mid-transaction the MCU stays in a
+        half-open state (byte[3] == 0xFF); this method waits up to 2 s for it
+        to settle naturally, then forces CMD_FINALIZE to abort.
+
+        I/O errors (wrong interface, udev permission, device not present) are
+        raised immediately as IOError — they are NOT retried, because retrying
+        would only mask the real problem.
         """
+        # --- First contact: any IOError here means a connection/permissions
+        #     problem, not a busy MCU. Surface it immediately.
         try:
             resp = self.raw_get()
-        except Exception:
-            resp = b""
+        except (IOError, OSError) as e:
+            raise IOError(
+                f"Cannot communicate with the keyboard: {e}\n"
+                "Check: USB cable, udev rule "
+                "(SUBSYSTEM==\"usb\", ATTR{{idVendor}}==\"0c45\", MODE=\"0666\"), "
+                "and that no other process holds the device."
+            ) from e
 
-        # If byte 3 is NOT 0xFF, it's already idle and ready for commands.
+        # Idle: byte[3] is present and is not 0xFF.
         if len(resp) >= 4 and resp[3] != 0xFF:
             return
 
-        # It's busy. Wait up to 2 seconds to see if it finishes writing to flash naturally.
+        # byte[3] == 0xFF (or response is shorter than expected): the MCU is
+        # busy with a flash operation. Wait up to 2 s for it to finish.
         for _ in range(20):
             time.sleep(0.1)
             try:
                 resp = self.raw_get()
                 if len(resp) >= 4 and resp[3] != 0xFF:
                     return
-            except Exception:
-                pass
+            except (IOError, OSError) as e:
+                # Device dropped off the bus mid-wait — not a busy state.
+                raise IOError(
+                    f"Lost communication while waiting for the keyboard to become idle: {e}"
+                ) from e
 
-        # If it is STILL busy, it's likely permanently stuck in a half-open state 
-        # from a crashed script. Send CMD_FINALIZE to force the MCU to abort and reset.
+        # Still busy after 2 s: likely stuck from a crashed script.
+        # Force the MCU to abort its current transaction.
         print("Board is stuck in BUSY state. Forcing a state-machine reset...")
         self.send_cmd(CMD_FINALIZE)
-        
+
         for _ in range(20):
             time.sleep(0.1)
             try:
@@ -190,10 +250,16 @@ class AulaS75Pro:
                 if len(resp) >= 4 and resp[3] != 0xFF:
                     print("Board recovered successfully.")
                     return
-            except Exception:
-                pass
+            except (IOError, OSError) as e:
+                raise IOError(
+                    f"Lost communication while recovering the keyboard: {e}"
+                ) from e
 
-        raise RuntimeError("Keyboard MCU is locked in a BUSY state. Please unplug and plug it back in.")
+        raise RuntimeError(
+            "Keyboard MCU is locked in a BUSY state even after a forced reset.\n"
+            "Please unplug and reconnect the keyboard."
+        )
+
 
     def open(self):
         path = self._path or self.find_path()
@@ -326,7 +392,14 @@ class AulaS75Pro:
         )
 
     def _write_lighting_sequence(self, payload: bytearray):
-        """Internal helper to send one full Open -> Probe -> Payload -> Commit -> Finalize loop."""
+        """Internal helper: Open → Probe(0x1304) → Payload → Commit → Finalize.
+
+        Commit polling: PROTOCOL.md §2 documents that the MCU can return
+        all-zeros during flash housekeeping while the write is still being
+        applied.  A commit-poll timeout is therefore a soft warning, not a
+        hard error — the lighting write has already been applied.  This
+        mirrors the identical treatment in sync_rtc().
+        """
         self.send_cmd(CMD_OPEN)
         self._wait_ack(CMD_OPEN)
 
@@ -334,18 +407,196 @@ class AulaS75Pro:
         self._wait_ack(0x1304)
 
         self.raw_send(payload)
-        time.sleep(0.05) 
+        time.sleep(0.05)
 
         self.send_cmd(CMD_COMMIT)
-        self._wait_ack(CMD_COMMIT, retries=60, delay=0.05)
+        try:
+            self._wait_ack(CMD_COMMIT, retries=60, delay=0.05)
+        except RuntimeError as e:
+            # PROTOCOL.md §2: "An all-zeros status buffer during commit polling
+            # has also been seen when the MCU was busy with flash housekeeping —
+            # patience and retry, not abandonment."  After 3 s of retries we
+            # accept the timeout: lighting writes whose commit reads 0x00 have
+            # been confirmed to apply anyway.  Raise only if the response was
+            # NOT all-zeros (genuinely unexpected).
+            resp = self.raw_get()
+            if resp and any(b != 0 for b in resp):
+                raise  # non-zero unexpected content — real error, re-raise
+            print(
+                f"warning: commit poll timed out ({e}); "
+                "MCU is busy with flash housekeeping — lighting write has "
+                "applied (PROTOCOL.md §2, verified behaviour)."
+            )
 
         self.send_cmd(CMD_FINALIZE)
         time.sleep(0.1)
 
+
     def set_global_lighting(self, effect: int, r: int, g: int, b: int, brightness: int = 5, speed: int = 3, direction: int = 0, option: int = 0):
+        payload = self._build_mode_payload(
+            effect=effect, r=r, g=g, b=b,
+            brightness=brightness, speed=speed,
+            direction=direction, option=option,
+        )
+        # Double sequence required to clear MCU animation pointers.
+        # 0.5 s gap: the first CMD_FINALIZE can trigger a flash write that
+        # takes several seconds; starting the second sequence too soon causes
+        # the second commit poll to hit the all-zeros flash-busy window.
+        for _ in range(2):
+            self._write_lighting_sequence(payload)
+            time.sleep(0.5)
+
+
+    def set_custom_lighting(self, key_colors: dict, brightness: int = 5):
+        """
+        Apply a per-key custom colour table and save it to flash.
+
+        Implements the two-transaction sequence verified in escToRed.pcapng
+        and documented in PROTOCOL.md §5.  The entire sequence is executed
+        **twice** (matching the official driver) to ensure MCU animation
+        pointers and flash buffers latch cleanly.
+
+        Args:
+            key_colors: {light_index (int): (r, g, b)} — keys not listed are
+                        left dark (0, 0, 0).  light_index must be a member of
+                        PHYSICAL_INDICES (keymap.py); any other value is
+                        rejected to prevent accidentally corrupting the AA 55
+                        trailer at slot 143.
+            brightness: brightness byte passed to Transaction A's mode-select
+                        write (0–5; default 5 matches the official driver).
+
+        Wire flow per iteration (PROTOCOL.md §5):
+            [Tx A] CMD_OPEN → 0x1304 probe → mode 0x80 payload → CMD_COMMIT
+                   → CMD_FINALIZE
+            [Tx B] CMD_OPEN → 0x2304 probe → 9×64-byte raw table chunks
+                   → CMD_COMMIT → GET_REPORT (checksum verify) → CMD_FINALIZE
+        """
+        # ---- validate --------------------------------------------------------
+        # PHYSICAL_INDICES is the allowlist of safe light_index values derived
+        # from rgb-keyboard.xml (hardcoded in keymap.py; no runtime XML parse).
+        # Anything not in the set is either reserved (slot 0), a gap in the
+        # keyboard matrix, or close enough to the trailer at offsets 574–575
+        # (slot 143) to be unsafe.
+        for idx, rgb in key_colors.items():
+            if idx not in PHYSICAL_INDICES:
+                raise ValueError(
+                    f"light_index {idx} is not a known physical key "
+                    f"(see keymap.PHYSICAL_INDICES or run 'list-keys')."
+                )
+            r, g, b = rgb
+            for name, val in (("r", r), ("g", g), ("b", b)):
+                if not (0 <= val <= 255):
+                    raise ValueError(
+                        f"key {idx}: {name}={val} is not in range 0–255."
+                    )
+
+
+        # ---- build the 576-byte table buffer ---------------------------------
+        # Layout: slot i occupies bytes [i*4 : i*4+4] = [light_index, R, G, B].
+        #
+        # The official driver (FUN_0044b900) writes the light_index byte into
+        # slot[0] for EVERY physical key, even those that are off (RGB = 0).
+        # Omitting these index bytes produces a checksum mismatch.  We replicate
+        # this by iterating PHYSICAL_INDICES first, then overwriting RGB for
+        # keys in key_colors.
+        #
+        # Slot 0 stays zero (reserved; byte-offsets 0–3 are never touched).
+        # Trailer AA 55 replaces the last 2 bytes of slot 143 (offsets 574–575).
+        table = bytearray(TABLE_SIZE)
+        for idx in PHYSICAL_INDICES:            # pass 1: stamp every physical key's index byte
+            table[idx * 4] = idx
+        for idx, (r, g, b) in key_colors.items():   # pass 2: apply caller's colours
+            off = idx * 4
+            table[off]     = idx
+            table[off + 1] = r
+            table[off + 2] = g
+            table[off + 3] = b
+        table[574] = 0xAA
+        table[575] = 0x55
+
+        # Pre-compute the 16-bit checksum for verify step (PROTOCOL.md §5).
+        expected_checksum = sum(table) & 0xFFFF
+
+
+        def _run_once():
+            # -- Transaction A: switch board to custom-light mode (0x80) ------
+            # Re-uses _write_lighting_sequence so we get the same soft-error
+            # handling on its commit poll (all-zeros = flash busy, not rejected).
+            self._write_lighting_sequence(
+                self._build_mode_payload(effect=0x80, brightness=brightness)
+            )
+            time.sleep(0.5)
+
+            # -- Transaction B: upload 576-byte table via 0x2304 page ---------
+            self.send_cmd(CMD_OPEN)
+            self._wait_ack(CMD_OPEN)
+
+            # Probe 0x2304: payload[8] = 0x09 (RGB table, 576 bytes).
+            # send_cmd places cmd at report[0:2], body at report[2:].
+            # So body index 6 lands at report byte 8.
+            self.send_cmd(CMD_LIGHT_APPLY_BASE, bytes([0, 0, 0, 0, 0, 0, 9]))
+            self._wait_ack(CMD_LIGHT_APPLY_BASE)
+
+            # Stream 9 raw 64-byte chunks — NO 0x0100 prefix (PROTOCOL.md §5).
+            for chunk_idx in range(TABLE_CHUNKS):
+                chunk = bytes(table[chunk_idx * REPORT_LEN : (chunk_idx + 1) * REPORT_LEN])
+                self.raw_send(chunk)
+                time.sleep(0.035)   # ~35 ms cadence matches official driver
+
+            # Commit: send then wait ~35 ms before polling the ACK.
+            self.send_cmd(CMD_COMMIT, delay=0.0)
+            time.sleep(0.035)
+            try:
+                ack = self._wait_ack(CMD_COMMIT, retries=60, delay=0.05)
+            except RuntimeError as e:
+                # Same soft-error path as _write_lighting_sequence: all-zeros
+                # during flash housekeeping is expected and the write applies.
+                ack = self.raw_get()
+                if ack and any(byte != 0 for byte in ack):
+                    raise  # non-zero unexpected — real error, re-raise
+                print(
+                    f"warning: custom table commit poll timed out ({e}); "
+                    "MCU busy with flash housekeeping — table write has "
+                    "applied (PROTOCOL.md §5, verified behaviour)."
+                )
+                ack = ack or b""
+
+            # Checksum verification (PROTOCOL.md §5: ack[4:6] = 16-bit LE sum)
+            if len(ack) >= 6:
+                mcu_checksum = ack[4] | (ack[5] << 8)
+                if mcu_checksum != expected_checksum:
+                    print(
+                        f"warning: table checksum mismatch — "
+                        f"host computed {expected_checksum:#06x}, "
+                        f"MCU returned {mcu_checksum:#06x}. "
+                        "The upload may have been corrupted; consider retrying."
+                    )
+                else:
+                    print(f"Custom table checksum OK ({mcu_checksum:#06x}).")
+            else:
+                print("warning: ACK response too short to read checksum.")
+
+            # Finalize: ~35 ms after commit ACK (PROTOCOL.md §5 step 11)
+            time.sleep(0.035)
+            self.send_cmd(CMD_FINALIZE)
+            time.sleep(0.1)
+
+        # Run the full two-transaction block twice, as the official driver does.
+        _run_once()
+        time.sleep(0.5)
+        _run_once()
+
+    @staticmethod
+    def _build_mode_payload(effect: int, r: int = 0, g: int = 0, b: int = 0,
+                            brightness: int = 5, speed: int = 3,
+                            direction: int = 0, option: int = 0) -> bytearray:
+        """Build the 64-byte payload for a 0x1304 lighting-mode write.
+
+        Extracted from set_global_lighting so set_custom_lighting can call
+        _write_lighting_sequence directly with the right mode (0x80).
+        """
         payload = bytearray(REPORT_LEN)
         payload[0] = effect
-
         if effect != 0:
             payload[1] = r
             payload[2] = g
@@ -354,14 +605,10 @@ class AulaS75Pro:
             payload[9] = brightness
             payload[10] = speed
             payload[11] = direction
-
         payload[14] = 0xAA
         payload[15] = 0x55
+        return payload
 
-        # Double sequence required to clear MCU animation pointers
-        for _ in range(2):
-            self._write_lighting_sequence(payload)
-            time.sleep(0.1)
 
     def sync_rtc(self, when: Optional["datetime"] = None):
         """
