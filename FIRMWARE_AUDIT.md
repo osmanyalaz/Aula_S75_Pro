@@ -166,7 +166,7 @@ All LEDs share the single RGB RAM buffer (`0x20001838` R, `0x2000195E` G, `0x200
 ### 3.2 `0x1304` `0x20–0x24` Underglow Behavior & `SideLightsRed.pcapng` Forensics
 - In `FUN_00003f42` (`0x00003F82`), when `hid_ctx+0x14 == 0x00009800` and `(payload[0] >> 4) == 2`:
   - Firmware reads **only `payload[0]`** (`mode = payload[0] & 0x0F`, valid `0..4`: `0`=flowing, `1`=spectrum, `2`=static, `3`=breathing, `4`=off), writes it to `*(uint8_t*)0x20000194`, sets `hid_ctx[8] = 1`, and skips writing flash `0x9800`.
-  - Color, brightness, and speed bytes in `payload[1..63]` are **never read** by `FUN_00003f42` for `0x20–0x24`.
+  - Color, brightness, and speed bytes in `payload[1..63]` are **never read** by `FUN_00003f42` for `0x20–0x24`. Consequently, **unlike main-key effects (`0x00–0x13` / `cli.py color`), the static underglow color (`0x22`) cannot be set over USB**; changing static/breathing underglow color is hardware-only via **`Fn + /?`**.
 - **Why `wireshark/SideLightsRed.pcapng` frame 3987 had no visible effect:**
   - Frame 3987 sent a standard main-key `0x1304` payload (`payload[0] = 0x01` static red, not `0x20–0x24`) or targeted the wrong subsystem; furthermore, `DeviceDriver.exe` never exposes a per-color USB setter for `0x20000194` — only `0x20–0x24` mode selection exists in firmware.
 - **Hardware verification (`test_underglow.py`):**
@@ -264,13 +264,15 @@ All items below are verified against [`aula_s75pro_screen.py`](screenUpload/aula
 - **Consequence:** Encoding any wire delay in `1..15` (`2..30 ms`) is silently overridden by the MCU to `0x19` (`50 ms` = 20 fps), causing unexpected slowdowns for high-FPS clips.
 - **Fix:** Clamp encoded wire delay ticks to **`[0x10, 0xFF]`** (`16..255` ticks = **`32 ms – 510 ms`** per frame, i.e., `~1.96–31.25 fps`), and update CLI `--delay` help/units to clearly distinguish milliseconds vs. 2 ms wire ticks.
 
-### 5.3 Hard Frame Cap = `191` Frames (NOT `254`) ([`aula_s75pro_screen.py:198,300,366`](screenUpload/aula_s75pro_screen.py#L198))
-- **Firmware (`FUN_0001047c` → `FUN_00010460(0x750000)`):**
-  - Calls `FUN_00007882(0x750000, 0xC0)`, reading only **`192` bytes (`0xC0`)** from the 256-byte SPI preamble into RAM at **`0x200021DA`**.
-  - Byte `0` (`0x200021DA`) is `N_frames`; bytes `1..191` (`0x200021DB–0x20002299`) hold **191 delay slots**.
-  - Uploading `192–254` frames causes `FUN_00011a84` to read frame delays **past the end of the 192-byte preamble buffer into live fuel-gauge / battery RAM at `0x200022A0+`**.
-  - Note: Pixel data still begins at SPI offset **`0x750100`** (`DAT_00010874`, full 256-byte preamble on flash) with stride **`0x0000FD20`** (`64,800` bytes at `0x000117CE`). Only the maximum frame count `N` must be capped to **`191`** (`0xC0 - 1`); `PREAMBLE = 256` stays unchanged.
-- **Fix:** Replace `254` with `MAX_FRAMES = 191` in `build_buffer()`, `extract_gif_frames()`, and `extract_video_frames()`.
+### 5.3 Hard Frame Cap = `140` Frames (`16 MB` 24-Bit SPI Flash Boundary; RAM Preamble Holds `191`) ([`aula_s75pro_screen.py`](screenUpload/aula_s75pro_screen.py))
+- **Primary Limit — 24-Bit SPI Flash Address Wrap (`FUN_00007858`, `FUN_000078be`, `FUN_00007964`):**
+  - The external SPI flash helpers transmit 24-bit addresses (`0x000000–0xFFFFFF` = **16 MB** `0x01000000`). `0x7204` (`0x000045d4`) always starts writing at `0x00750000`, erasing/programming in `4 KB` (`0x1000`) chunks (`PREAMBLE = 256` bytes followed by pixel stride `0x0000FD20` = `64,800` bytes at `0x750100`).
+  - `140` frames require `256 + 140 × 64,800 = 9,072,256` bytes → **`2,215` chunks (`0x008A7000`)**, ending cleanly at **`0x00750000 + 0x008A7000 = 0x00FF7000 <= 0x01000000`**.
+  - `141` frames (matching OEM `rgb-keyboard.xml` `gif_maxframes="141"`) require **`2,231` chunks (`0x008B7000`)**, reaching **`0x01007000 > 0x01000000`** — wrapping **28 KB** past 16 MB back onto `0x00000000` and erasing factory TFT assets (`0x00000124–0x0028D44E`).
+- **Secondary RAM Limit (`FUN_0001047c` → `FUN_00010460(0x750000)`):**
+  - Calls `FUN_00007882(0x750000, 0xC0)`, reading only **`192` bytes (`0xC0`)** from the 256-byte SPI preamble into RAM at **`0x200021DA`** (`N_frames` + **`191` delay slots** at `0x200021DB–0x20002299`). Uploading `>= 192` frames would also read past `0x20002299` into live fuel-gauge / battery RAM at `0x200022A0+`.
+- **VFR Video Deduplication:** `iio.imiter(..., plugin="FFMPEG")` decodes VFR clips (such as `4.0 s` MP4s reported with `fps=0.58`) into duplicated raw frames. `extract_video_frames()` derives actual `ms_per_raw = duration * 1000 / total_decoded_raw` when EOF duration disagrees with `meta['fps']`, collapses consecutive identical RGB565 runs via `collapse_video_runs()`, and splits holds `> 510 ms` into the minimum number of `<= 510 ms` copies (or 1 frame per unique run when `--delay` is given).
+- **Fix:** Tighten `MAX_FRAMES = 140` (keeping `PREAMBLE = 256`) across `make_cmd_upload()`, `build_buffer()`, `extract_gif_frames()`, and `extract_video_frames()`, and add `collapse_video_runs()` for VFR videos.
 
 ### 5.4 Ignored `0x7204` `cmd[2]` Mode Byte ([`aula_s75pro_screen.py:162,167,175`](screenUpload/aula_s75pro_screen.py#L167))
 - In firmware (`0x000045D4`), `0x7204` **never reads `buf[2]`** (`0x03` still vs. `0x05` GIF); it always sets SPI base = `0x00750000` and reads `chunks = buf[8] | (buf[9] << 8)`. In `DeviceDriver.exe.c:30381/30595`, `cmd[2]` was merely `LCDViewList::GetCurSel() + 1`. Keeping `0x03`/`0x05` is harmless for wire compatibility, but the firmware distinguishes still vs. GIF solely from `N_frames` at SPI `0x00750000`.

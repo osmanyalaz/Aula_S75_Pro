@@ -35,8 +35,9 @@ Reverse-engineered from USB/HID traffic captures (usbmon + Wireshark).
 │                                                                         │
 │  delay unit: 2 ms wire ticks (0x10..0xFF = 32..510 ms). Values < 0x10   │
 │  are silently replaced with 0x19 (50 ms) by firmware FUN_00011a84.      │
-│  Max N_frames = 191 (0xC0 - 1): MCU reads 192 B (0xC0) into RAM         │
-│  0x200021DA; > 191 frames overflows past 0x20002299 into fuel-gauge RAM.│
+│  Max N_frames = 140: 140 frames = 2,215 4KB chunks ending at 0x00FF7000 │
+│  (within 16 MB SPI limit 0x01000000; 141+ wraps to 0x00000000, while    │
+│  RAM preamble 0x200021DA holds up to 191 slots).                        │
 │  Still image uses delay=0x19=25 ticks (50 ms).                         │
 └─────────────────────────────────────────────────────────────────────────┘
 
@@ -72,7 +73,7 @@ udev rule (so you can run without sudo):
 Usage:
     python3 aula_s75pro_screen.py photo.jpg          # still image
     python3 aula_s75pro_screen.py photo.jpg --fit    # letterbox to fit
-    python3 aula_s75pro_screen.py anim.gif           # animated GIF (up to 191 frames)
+    python3 aula_s75pro_screen.py anim.gif           # animated GIF (up to 140 frames)
     python3 aula_s75pro_screen.py anim.gif --delay 50  # override frame delay (ms, 32-510)
     python3 aula_s75pro_screen.py clip.mp4           # video, auto-converted
     python3 aula_s75pro_screen.py clip.mp4 --fps 10 --max-frames 60
@@ -97,10 +98,12 @@ SCREEN_H   = 240   # portrait: 240 px tall
 CHUNK_SIZE = 4096           # bytes per interrupt-OUT transfer
 PREAMBLE   = 256            # SPI flash header size before pixel_0 at 0x750100
 PIXEL_BYTES = SCREEN_W * SCREEN_H * 2  # 64 800  (135×240×2)
-# Firmware FUN_00010460(0x750000) calls FUN_00007882(0x750000, 0xC0), copying only
-# 192 bytes (0xC0) into RAM 0x200021DA: byte 0 = N_frames, bytes 1..191 = 191 delay
-# slots. Uploading >= 192 frames reads past 0x20002299 into fuel-gauge RAM (0x200022A0+).
-MAX_FRAMES = 191            # 0xC0 - 1
+# Primary cap = 140 frames: the external SPI flash uses 24-bit addresses (16 MB = 0x01000000)
+# starting from base 0x00750000. 140 frames (256 + 140*64,800 = 9,072,256 B -> 2,215 4KB
+# chunks = 0x008A7000) ends at 0x00FF7000 <= 0x01000000; 141 frames wraps past 16 MB onto
+# factory TFT assets at 0x00000000. (Secondary RAM limit: FUN_00010460 reads 0xC0=192
+# preamble bytes -> max 191 delay slots at 0x200021DA..0x20002299.)
+MAX_FRAMES = 140
 
 # HID endpoints (confirmed from captures)
 HID_IFACE  = 3
@@ -174,8 +177,8 @@ def make_cmd_upload(n_frames: int) -> bytes:
     """
     if not (1 <= n_frames <= MAX_FRAMES):
         raise ValueError(
-            f"Frame count must be 1–{MAX_FRAMES} (MCU copies only 0xC0=192 preamble bytes "
-            f"into RAM 0x200021DA..0x20002299), got {n_frames}."
+            f"Frame count must be 1–{MAX_FRAMES} (140 frames end at 0x00FF7000 within "
+            f"the 16 MB 24-bit SPI boundary 0x01000000 from base 0x00750000), got {n_frames}."
         )
     mode   = 0x03 if n_frames == 1 else 0x05  # ignored by 0x000045D4; wire parity only
     chunks = total_chunks_needed(n_frames)
@@ -193,7 +196,7 @@ def make_cmd_upload(n_frames: int) -> bytes:
 
 def build_buffer(frames_rgb565: list, delays: list) -> bytes:
     """
-    Assemble the complete transfer buffer for N frames (1 <= N <= MAX_FRAMES = 191).
+    Assemble the complete transfer buffer for N frames (1 <= N <= MAX_FRAMES = 140).
 
     frames_rgb565 : list of bytes objects, each PIXEL_BYTES long
     delays        : list of int, per-frame hold duration in 2 ms wire ticks
@@ -212,8 +215,8 @@ def build_buffer(frames_rgb565: list, delays: list) -> bytes:
         raise ValueError(f"frames ({n}) and delays ({len(delays)}) must have the same length")
     if not (1 <= n <= MAX_FRAMES):
         raise ValueError(
-            f"Frame count must be 1–{MAX_FRAMES} (0xC0 - 1; >191 overflows past "
-            f"0x20002299 into fuel-gauge RAM), got {n}."
+            f"Frame count must be 1–{MAX_FRAMES} (>140 wraps past 16 MB 0x01000000 "
+            f"from SPI base 0x00750000 onto 0x00000000), got {n}."
         )
 
     total = total_chunks_needed(n) * CHUNK_SIZE
@@ -318,8 +321,8 @@ def extract_gif_frames(path: str, fit: bool, delay_override: int | None):
     """
     Extract frames from a GIF, return (frames_rgb565, delays_ticks).
 
-    Capped at MAX_FRAMES (191 = 0xC0 - 1) — the firmware copies only 192 preamble
-    bytes from SPI 0x750000 into RAM 0x200021DA..0x20002299.
+    Capped at MAX_FRAMES (140) — fits within the 16 MB 24-bit SPI limit
+    (0x00750000 + 2,215*4096 = 0x00FF7000 <= 0x01000000; RAM holds <= 191 slots).
 
     delay_override: optional override in milliseconds (clamped to 32-510 ms).
     delays_ticks: per-frame delay in 2 ms wire ticks (clamped to 0x10-0xFF).
@@ -339,7 +342,7 @@ def extract_gif_frames(path: str, fit: bool, delay_override: int | None):
     with Image.open(path) as gif:
         for frame in ImageSequence.Iterator(gif):
             # Check the limit before converting: avoids wasted pixel work on
-            # frame 192+ and prevents exceeding MAX_FRAMES.
+            # frame 141+ and prevents exceeding MAX_FRAMES.
             if len(frames_rgb565) >= MAX_FRAMES:
                 print(f"  ! reached the {MAX_FRAMES}-frame device limit, truncating")
                 break
@@ -360,6 +363,54 @@ def extract_gif_frames(path: str, fit: bool, delay_override: int | None):
 VIDEO_EXTENSIONS = {'.mp4', '.mov', '.webm', '.mkv', '.avi', '.m4v'}
 
 
+def _split_hold_duration(run_ms: float) -> tuple[int, int]:
+    """Return ``(copies, per_copy_ticks)`` splitting holds > MAX_DELAY_MS evenly."""
+    import math
+
+    copies = max(1, math.ceil((run_ms - 1e-6) / MAX_DELAY_MS))
+    per_copy_ticks = ms_to_wire_delay(run_ms / copies)
+    return copies, per_copy_ticks
+
+
+def collapse_video_runs(
+    runs: list[tuple[bytes, int]],
+    ms_per_frame: float,
+    delay_override: int | None,
+    max_frames: int,
+) -> tuple[list[bytes], list[int]]:
+    """
+    Collapse consecutive duplicate decoded video frames into upload frames and delays.
+
+    runs: list of (frame_rgb565, repeat_count) pairs for consecutive identical frames.
+    ms_per_frame: duration represented by each sampled raw frame in milliseconds.
+    delay_override: when set, emit 1 frame per unique run with this clamped ms delay.
+        Otherwise sum each run's hold (repeat_count * ms_per_frame) and split into the
+        minimum number of <= 510 ms (0xFF tick) copies only when the hold exceeds 510 ms.
+    """
+    if not runs or max_frames <= 0:
+        return [], []
+
+    override_ticks = ms_to_wire_delay(delay_override) if delay_override is not None else None
+    frames_rgb565: list[bytes] = []
+    delays_ticks: list[int] = []
+
+    for frame_bytes, count in runs:
+        if len(frames_rgb565) >= max_frames:
+            break
+        if override_ticks is not None:
+            frames_rgb565.append(frame_bytes)
+            delays_ticks.append(override_ticks)
+            continue
+
+        copies, per_copy_ticks = _split_hold_duration(count * ms_per_frame)
+        emit = min(copies, max_frames - len(frames_rgb565))
+        for _ in range(emit):
+            frames_rgb565.append(frame_bytes)
+            delays_ticks.append(per_copy_ticks)
+
+    return frames_rgb565, delays_ticks
+
+
 def extract_video_frames(path: str, fit: bool, delay_override: int | None,
                           fps_override: float | None, max_frames: int | None):
     """
@@ -371,7 +422,7 @@ def extract_video_frames(path: str, fit: bool, delay_override: int | None,
 
     fps_override: if given, frames are decimated to approximate this rate
     instead of using every decoded frame (videos are usually 24-60fps, which
-    is far more frames than useful on a 191-frame-max, single-color-depth
+    is far more frames than useful on a 140-frame-max, single-color-depth
     LCD upload - a lower fps keeps the transfer size/time sane).
     delay_override: optional override in milliseconds (clamped to 32-510 ms).
     """
@@ -385,7 +436,7 @@ def extract_video_frames(path: str, fit: bool, delay_override: int | None,
         meta = iio.immeta(path, plugin="FFMPEG")
     except ImportError:
         sys.exit("Video decoding backend missing:  pip install imageio-ffmpeg")
-    src_fps = meta.get('fps') or 24.0
+    src_fps = float(meta.get('fps') or 24.0)
     target_fps = fps_override or src_fps
     # keep every Nth source frame to approximate target_fps
     step = max(1, round(src_fps / target_fps))
@@ -397,31 +448,64 @@ def extract_video_frames(path: str, fit: bool, delay_override: int | None,
                 f"clamping to {MIN_DELAY_MS}–{MAX_DELAY_MS} ms "
                 f"(0x{MIN_WIRE_DELAY:02X}–0x{MAX_WIRE_DELAY:02X} ticks)."
             )
-        delay_ticks = ms_to_wire_delay(delay_override)
-    else:
-        effective_fps = src_fps / step
-        ms_per_frame = 1000.0 / effective_fps
-        delay_ticks = ms_to_wire_delay(ms_per_frame)
 
     if max_frames is not None and max_frames > MAX_FRAMES:
         print(f"  ! --max-frames {max_frames} exceeds device limit; capping at {MAX_FRAMES}")
     effective_max = min(max_frames, MAX_FRAMES) if max_frames is not None else MAX_FRAMES
 
-    frames_rgb565 = []
-    delays_ticks = []
+    runs: list[tuple[bytes, int]] = []
+    total_decoded_raw = 0
+    total_sampled = 0
+    reached_eof = True
     for i, frame in enumerate(iio.imiter(path, plugin="FFMPEG")):
+        total_decoded_raw += 1
         if i % step != 0:
             continue
-        if len(frames_rgb565) >= effective_max:
-            if max_frames is None:
-                print(f"  ! reached the {MAX_FRAMES}-frame device limit, truncating")
-            break
         img = Image.fromarray(frame)
-        frames_rgb565.append(pil_to_rgb565(img, fit=fit))
-        delays_ticks.append(delay_ticks)
+        rgb = pil_to_rgb565(img, fit=fit)
+        total_sampled += 1
+        if runs and rgb == runs[-1][0]:
+            prev_bytes, prev_count = runs[-1]
+            runs[-1] = (prev_bytes, prev_count + 1)
+        else:
+            if len(runs) >= effective_max:
+                reached_eof = False
+                break
+            runs.append((rgb, 1))
 
-    if not frames_rgb565:
+    if not runs:
         sys.exit(f"No frames could be decoded from {path}")
+
+    ms_per_raw = 1000.0 / src_fps
+    try:
+        duration_sec = float(meta.get('duration') or 0.0)
+    except (TypeError, ValueError):
+        duration_sec = 0.0
+    if reached_eof and duration_sec > 0 and total_decoded_raw > 0:
+        actual_fps = total_decoded_raw / duration_sec
+        if abs(actual_fps - src_fps) / max(src_fps, 1e-6) > 0.15:
+            ms_per_raw = (duration_sec * 1000.0) / total_decoded_raw
+            print(
+                f"  VFR timing detected: meta fps={src_fps:g} vs "
+                f"{total_decoded_raw} frames/{duration_sec:g}s ({actual_fps:g} fps)"
+            )
+    ms_per_sampled = ms_per_raw * step
+
+    frames_rgb565, delays_ticks = collapse_video_runs(
+        runs, ms_per_sampled, delay_override, effective_max
+    )
+    if total_sampled > len(runs):
+        print(f"  collapsed {total_sampled} sampled frames into {len(runs)} unique keyframe runs ({len(frames_rgb565)} output frames)")
+
+    truncated = not reached_eof
+    if not truncated and delay_override is None:
+        total_unbounded = sum(
+            _split_hold_duration(count * ms_per_sampled)[0] for _, count in runs
+        )
+        truncated = total_unbounded > effective_max
+    if truncated and max_frames is None:
+        print(f"  ! reached the {MAX_FRAMES}-frame device limit, truncating")
+
     return frames_rgb565, delays_ticks
 
 

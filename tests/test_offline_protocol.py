@@ -690,7 +690,7 @@ class ScreenUploaderTests(unittest.TestCase):
         self.assertEqual(screen.MAX_WIRE_DELAY, 0xFF)
         self.assertEqual(screen.MIN_DELAY_MS, 32)
         self.assertEqual(screen.MAX_DELAY_MS, 510)
-        self.assertEqual(screen.MAX_FRAMES, 191)
+        self.assertEqual(screen.MAX_FRAMES, 140)
 
         ms_cases = {
             0: 16,
@@ -713,37 +713,41 @@ class ScreenUploaderTests(unittest.TestCase):
         frame = screen.solid_rgb565(255, 0, 0)
         self.assertEqual(len(frame), screen.PIXEL_BYTES)
 
-        # Boundary valid counts: 1 and 191
+        # Boundary valid counts: 1 and 140 (stays within 16 MB SPI 0x01000000 from 0x00750000)
         buf1 = screen.build_buffer([frame], [screen.DEFAULT_STILL_DELAY])
         self.assertEqual(buf1[0], 1)
         self.assertEqual(buf1[1], 0x19)
         self.assertEqual(buf1[screen.PREAMBLE : screen.PREAMBLE + 2], b"\x00\xf8")
 
-        buf191 = screen.build_buffer([frame] * 191, [0x20] * 191)
-        self.assertEqual(buf191[0], 191)
-        self.assertEqual(list(buf191[1:192]), [0x20] * 191)
-        self.assertEqual(buf191[192:256], bytes([0xFF] * 64))
-        cmd191 = screen.make_cmd_upload(191)
-        self.assertEqual(cmd191[0:2], b"\x04\x72")
+        buf140 = screen.build_buffer([frame] * 140, [0x20] * 140)
+        self.assertEqual(buf140[0], 140)
+        self.assertEqual(list(buf140[1:141]), [0x20] * 140)
+        self.assertEqual(buf140[141:256], bytes([0xFF] * 115))
+        chunks_140 = len(buf140) // screen.CHUNK_SIZE
+        self.assertEqual(chunks_140, 2215)
+        self.assertLessEqual(0x00750000 + len(buf140), 0x01000000)
+        cmd140 = screen.make_cmd_upload(140)
+        self.assertEqual(cmd140[0:2], b"\x04\x72")
+        self.assertEqual(int.from_bytes(cmd140[8:10], "little"), 2215)
 
         # Out-of-range tick warns and clamps to >= 0x10
         with self.assertWarns(UserWarning):
             buf_clamped = screen.build_buffer([frame], [5])
         self.assertEqual(buf_clamped[1], 0x10)
 
-        # Invalid frame counts raise ValueError
-        for bad_n in (0, 192, 254):
+        # Invalid frame counts raise ValueError (141+ wraps 24-bit SPI past 0x01000000)
+        for bad_n in (0, 141, 191, 254):
             with self.assertRaises(ValueError):
                 screen.make_cmd_upload(bad_n)
             with self.assertRaises(ValueError):
                 screen.build_buffer([frame] * bad_n, [0x20] * bad_n)
 
-    def test_extract_gif_frames_truncates_at_191_and_clamps_delays(self):
+    def test_extract_gif_frames_truncates_at_140_and_clamps_delays(self):
         from PIL import Image
 
         with tempfile.NamedTemporaryFile(suffix=".gif") as tmp:
-            imgs = [Image.new("RGB", (8, 8), (i % 256, 0, 0)) for i in range(200)]
-            durations = [10 if i == 0 else (40 if i == 1 else (800 if i == 2 else 50)) for i in range(200)]
+            imgs = [Image.new("RGB", (8, 8), (i % 256, 0, 0)) for i in range(150)]
+            durations = [10 if i == 0 else (40 if i == 1 else (800 if i == 2 else 50)) for i in range(150)]
             imgs[0].save(
                 tmp.name,
                 save_all=True,
@@ -755,12 +759,81 @@ class ScreenUploaderTests(unittest.TestCase):
             with contextlib.redirect_stdout(out):
                 frames, delays = screen.extract_gif_frames(tmp.name, fit=False, delay_override=None)
 
-        self.assertEqual(len(frames), 191)
-        self.assertEqual(len(delays), 191)
+        self.assertEqual(len(frames), 140)
+        self.assertEqual(len(delays), 140)
         self.assertEqual(delays[0], 0x10)  # 10 ms clamped up to 32 ms (0x10)
         self.assertEqual(delays[1], 0x14)  # 40 ms -> 20 ticks (0x14)
         self.assertEqual(delays[2], 0xFF)  # 800 ms clamped down to 510 ms (0xFF)
-        self.assertIn("191-frame device limit", out.getvalue())
+        self.assertIn("140-frame device limit", out.getvalue())
+
+    def test_extract_video_frames_vfr_dedup_and_delay_splitting(self):
+        import types
+        from unittest import mock
+        import numpy as np
+
+        def make_raw(r: int, g: int, b: int):
+            return np.full((4, 4, 3), (r, g, b), dtype=np.uint8)
+
+        c0, c1, c2 = make_raw(255, 0, 0), make_raw(0, 255, 0), make_raw(0, 0, 255)
+        vfr_frames = [c0] * 7 + [c1] * 9 + [c2] * 4
+        cfr_short = [c0] * 2 + [c1] * 3 + [c2] * 5
+        many_unique = [make_raw((k % 32) * 8, (k // 32) * 32, 0) for k in range(150)]
+
+        scenarios = [
+            # Case A: VFR (fps=0.58 disagrees with 20 frames in 4.0s -> 200 ms/raw, split >510ms)
+            (
+                {"fps": 0.58, "duration": 4.0},
+                vfr_frames,
+                None,
+                9,
+                [233] * 3 + [225] * 4 + [200] * 2,
+            ),
+            # Case B: Same VFR clip with --delay 100 -> 1 copy per unique run
+            (
+                {"fps": 0.58, "duration": 4.0},
+                vfr_frames,
+                100,
+                3,
+                [50, 50, 50],
+            ),
+            # Case C: Short runs <= 510ms combine directly without extra copies
+            (
+                {"fps": 10.0, "duration": 1.0},
+                cfr_short,
+                None,
+                3,
+                [100, 150, 250],
+            ),
+            # Case D: >140 unique frames truncated at MAX_FRAMES=140
+            (
+                {"fps": 30.0, "duration": 5.0},
+                many_unique,
+                None,
+                140,
+                [17] * 140,
+            ),
+        ]
+
+        for meta, raw_seq, delay_override, exp_count, exp_delays in scenarios:
+            fake_v3 = types.SimpleNamespace(
+                immeta=lambda _path, plugin=None: meta,
+                imiter=lambda _path, plugin=None: iter(raw_seq),
+            )
+            fake_pkg = types.SimpleNamespace(v3=fake_v3)
+            out = io.StringIO()
+            with mock.patch.dict(sys.modules, {"imageio": fake_pkg, "imageio.v3": fake_v3}):
+                with contextlib.redirect_stdout(out):
+                    frames, delays = screen.extract_video_frames(
+                        "dummy.mp4",
+                        fit=False,
+                        delay_override=delay_override,
+                        fps_override=None,
+                        max_frames=None,
+                    )
+            self.assertEqual(len(frames), exp_count)
+            self.assertEqual(delays, exp_delays)
+            if exp_count == 140:
+                self.assertIn("140-frame device limit", out.getvalue())
 
 
 class CliMockTests(unittest.TestCase):

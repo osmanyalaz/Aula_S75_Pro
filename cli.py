@@ -20,11 +20,79 @@ import sys
 
 from aula_s75pro import (
     AulaS75Pro,
+    EFFECTS,
     KEYMAP,
     PHYSICAL_INDICES,
     REPORT_LEN,
     UNDERGLOW_MODES,
 )
+
+EFFECT_NOTES = {
+    0: "LedOff (pure 0x00 payload; firmware reloads stored flash effect)",
+    1: "Static (solid RGB when --opt 0; fixed rainbow gradient when --opt 1)",
+    2: "SingleOn (light key on press)",
+    3: "SingleOff (light off on press; random per-key colors when --opt 1)",
+    4: "Glittering",
+    5: "Fluttering",
+    6: "Colourful (natively rainbow; ignores --opt)",
+    7: "Breath",
+    8: "Spectrum",
+    9: "Outward",
+    10: "Scrolling (--dir: 0=Down, 2=Up)",
+    11: "Rolling (--dir: 0=Right, 1=Left)",
+    12: "Rotating (--dir: 0=Right, 1=Left)",
+    13: "Explode",
+    14: "Launch",
+    15: "Ripples",
+    16: "Flowing (--dir: 0=Right, 1=Left)",
+    17: "Pulsating",
+    18: "Tilt (--dir: 0=Right, 1=Left)",
+    19: "Shuttle",
+}
+
+
+def format_effects_table() -> str:
+    """Return a human-readable table of all 20 main-key lighting effects."""
+    id_to_name = {eid: name for name, eid in EFFECTS.items()}
+    lines = ["Available effect IDs (0-19):"]
+    for eid in sorted(id_to_name):
+        name = id_to_name[eid]
+        note = EFFECT_NOTES.get(eid, "")
+        lines.append(f"  {eid:>2} (0x{eid:02X})  {name:<12}  {note}")
+    lines.extend([
+        "",
+        "Parameter notes:",
+        "  r g b         RGB color channels (0-255 each; used when --opt 0)",
+        "  --effect      Effect ID (0-19) or name (e.g. static, breath, flowing)",
+        "  --brightness  LED brightness level (0-5, default 5)",
+        "  --speed       Animation speed (0-5, default 3)",
+        "  --dir         Direction: 0=Right/Down, 1=Left, 2=Up (effect-dependent)",
+        "  --opt         Color mode: 0=Solid RGB (use r g b), 1=Hardware multi-color/rainbow",
+    ])
+    return "\n".join(lines)
+
+
+def _parse_effect(value: str) -> int:
+    key = value.strip().lower()
+    if key in EFFECTS:
+        return EFFECTS[key]
+    try:
+        eid = int(key, 0)
+    except ValueError as exc:
+        valid = ", ".join(f"{eid}:{name}" for name, eid in sorted(EFFECTS.items(), key=lambda kv: kv[1]))
+        raise argparse.ArgumentTypeError(f"unknown effect {value!r}; expected 0-19 or name ({valid})") from exc
+    if not (0 <= eid <= 19):
+        raise argparse.ArgumentTypeError(f"effect ID {eid} out of range (must be 0-19)")
+    return eid
+
+
+class _AvailableEffectsAction(argparse.Action):
+    def __init__(self, option_strings, dest, **kwargs):
+        super().__init__(option_strings, dest, nargs=0, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        print(format_effects_table())
+        parser.exit(0)
 
 
 
@@ -319,15 +387,41 @@ def main():
     sp.set_defaults(func=cmd_list_keys)
 
 
-    parser_color = sub.add_parser('color', help='Set global lighting effect')
-    parser_color.add_argument('r', type=int, help='Red (0-255)')
-    parser_color.add_argument('g', type=int, help='Green (0-255)')
-    parser_color.add_argument('b', type=int, help='Blue (0-255)')
-    parser_color.add_argument('--effect', type=int, default=1, help='Effect ID (0-19)')
-    parser_color.add_argument('--brightness', type=int, default=5, help='Brightness (0-5)')
-    parser_color.add_argument('--speed', type=int, default=3, help='Speed (0-5)')
-    parser_color.add_argument('--dir', type=int, default=0, help='Direction: 0(Right/Down), 1(Left), 2(Up)')
-    parser_color.add_argument('--opt', type=int, default=0, help='Option flag (1=Rainbow/Cycle, 0=Solid)')
+    parser_color = sub.add_parser(
+        'color',
+        help='Set global lighting effect',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description='Set the main-key global lighting effect (0x1304, effect IDs 0-19).',
+        epilog=format_effects_table(),
+    )
+    parser_color.add_argument('r', type=int, help='Red channel (0-255)')
+    parser_color.add_argument('g', type=int, help='Green channel (0-255)')
+    parser_color.add_argument('b', type=int, help='Blue channel (0-255)')
+    parser_color.add_argument(
+        '--effect', type=_parse_effect, default=1, metavar='ID_OR_NAME',
+        help='Effect ID (0-19) or name (default: 1=static); see list below',
+    )
+    parser_color.add_argument(
+        '--available-effects', '--available-effect',
+        action=_AvailableEffectsAction,
+        help='Show all available effect IDs (0-19) and parameter details, then exit',
+    )
+    parser_color.add_argument(
+        '--brightness', type=int, default=5,
+        help='Brightness level 0-5 (0=dimmest/off, 5=max; default: 5)',
+    )
+    parser_color.add_argument(
+        '--speed', type=int, default=3,
+        help='Animation speed 0-5 (0=slowest, 5=fastest; default: 3)',
+    )
+    parser_color.add_argument(
+        '--dir', type=int, default=0,
+        help='Animation direction: 0=Right/Down, 1=Left, 2=Up (default: 0)',
+    )
+    parser_color.add_argument(
+        '--opt', type=int, default=0,
+        help='Color option: 0=Solid RGB (use r g b), 1=Hardware multi-color/rainbow (default: 0)',
+    )
     parser_color.set_defaults(func=cmd_set_color)
 
     parser_custom = sub.add_parser(
