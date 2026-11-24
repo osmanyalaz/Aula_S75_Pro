@@ -17,7 +17,9 @@ See PROTOCOL.md in this folder for the full write-up of what was verified vs. in
 
 from __future__ import annotations
 
+import struct
 import time
+import warnings
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Optional
@@ -63,14 +65,22 @@ REPORT_ID = 0x00
 REPORT_LEN = 64  # payload length (wLength = 0x40), NOT counting the HID report-id byte
 
 # Command words (little-endian on the wire: byte0=lo, byte1=hi)
-CMD_OPEN = 0x1804        # generic "begin" ping, sent before almost every write
-CMD_PROBE = 0x1704       # fixed probe/ack, sent before the general settings write
-CMD_GENERAL_SETTINGS = 0x0100   # fn-switch / sleep-timer / key-response write
-CMD_COMMIT = 0x0204       # commit / select page for read-back
-CMD_FINALIZE = 0xF004     # finalize, seen after bulk (lighting) writes
-CMD_LIGHT_APPLY_BASE = 0x2304   # probe: custom-light table page (payload[8]=9 for RGB, 3 for mono)
-CMD_LIGHT_READ = 0x04F5         # readback current light table via GET_REPORT
-CMD_STREAM_FRAME = 0x2004 # frame update for dynamic RGB music mode
+CMD_COMMIT = 0x0204             # commit / read 32-bit LE checksum in resp[4..7]
+CMD_DEVICE_INFO = 0x0504        # read device info block from flash 0x00008F80 (max 2 chunks)
+CMD_LIGHTING_READ = 0x1204      # read lighting config page from flash 0x00009800 (max 1 chunk)
+CMD_LIGHTING_WRITE = 0x1304     # write flash 0x00009800 or Row-6 underglow mode (0x20-0x24)
+CMD_SETTINGS_READ = 0x1604      # read general settings page from flash 0x00009000 (max 1 chunk)
+CMD_SETTINGS_WRITE = 0x1704     # write general settings page to flash 0x00009000 (max 1 chunk)
+CMD_PROBE = CMD_SETTINGS_WRITE  # backwards-compatible alias
+CMD_OPEN = 0x1804               # generic "begin" ping & enable custom keymap/macro interception
+CMD_GENERAL_SETTINGS = 0x0100   # general settings / RTC write payload prefix
+CMD_CUSTOM_LIGHT_READ = 0x2204  # read saved flash custom RGB table (0x00009C00, max 9 chunks)
+CMD_LIGHT_APPLY_BASE = 0x2304   # write custom RGB table to flash (0x00009C00, payload[8]=9 for RGB)
+CMD_RTC_WRITE = 0x2804          # select RTC write page (State 6)
+CMD_FINALIZE = 0xF004           # finalize: persist runtime snapshot to flash 0x8000
+CMD_LIGHT_READ = 0xF504         # wire 04 F5: read live RGB RAM (0x20001838/195E/1A84; checksum=0)
+CMD_BATTERY_LEVEL = 0xF604      # wire 04 F6: read quantized battery level (0-5) in resp[4]
+CMD_STREAM_FRAME = 0x2004       # frame update for dynamic RGB music mode (ISR fast-path)
 
 TRAILER = b"\xAA\x55"     # observed at the very end of the 64-byte buffer on writes
 
@@ -78,10 +88,45 @@ TRAILER = b"\xAA\x55"     # observed at the very end of the 64-byte buffer on wr
 TABLE_SIZE   = 576  # 144 slots × 4 bytes each (light_index, R, G, B)
 TABLE_CHUNKS = 9    # 576 / 64 bytes-per-report
 
+# Row-6 side / underglow modes (0x1304 with payload[0] = 0x20 + mode_id)
+UNDERGLOW_MODES = {
+    "flowing": 0,
+    "spectrum": 1,
+    "static": 2,
+    "breathing": 3,
+    "off": 4,
+}
+UNDERGLOW_MODE_NAMES = {v: k for k, v in UNDERGLOW_MODES.items()}
+# Phase 1 erases 0x9800 and FUN_00003f42 skips writing it for 0x20-0x24:
+# 0x00004645 stack word (0x45 + 0x46 = 0x8B) + 60 * 0xFF (0x3BC4) = 0x00003C4F.
+EXPECTED_UNDERGLOW_ERASED_CHECKSUM = 0x00003C4F
+
+BATTERY_RANGES = {
+    0: "<6%",
+    1: "6–25%",
+    2: "26–50%",
+    3: "51–75%",
+    4: "76–95%",
+    5: "96–100%",
+}
+SLEEP_TIME_LABELS = {0: "off", 1: "1 min", 2: "5 min", 3: "30 min"}
+DEBOUNCE_SCANS = {1: 2, 2: 3, 3: 7, 4: 10, 5: 14}
+
+
+class McuRejectedError(RuntimeError):
+    """Raised immediately when the MCU responds with explicit error status 0xFF."""
+
 
 def _le16(cmd: int) -> bytes:
     """Encode a command word as little-endian bytes (byte0=lo, byte1=hi)."""
     return bytes([cmd & 0xFF, (cmd >> 8) & 0xFF])
+
+
+def parse_commit_checksum(resp: bytes) -> int:
+    """Decode the 32-bit little-endian byte-sum checksum from CMD_COMMIT resp[4..7]."""
+    if len(resp) < 8:
+        raise ValueError(f"Commit ACK too short ({len(resp)} bytes) for 32-bit LE checksum")
+    return struct.unpack_from("<I", resp, 4)[0]
 
 
 def build_report(cmd: int, body: bytes = b"", trailer: bool = False, size: int = REPORT_LEN) -> bytearray:
@@ -301,124 +346,159 @@ class AulaS75Pro:
         if delay:
             time.sleep(delay)
 
-    def _wait_ack(self, expected_cmd: int, retries: int = 50, delay: float = 0.05) -> bytes:
-        """Read GET_REPORT until the device ACKs the expected command word and signals ready (byte[3] == 0x01)."""
+    def _wait_ack(
+        self,
+        expected_cmd: int,
+        retries: int = 50,
+        delay: float = 0.05,
+        settle: float = 0.036,
+    ) -> bytes:
+        """Read GET_REPORT until the device ACKs the expected command word (byte[3] == 0x01) or rejects with 0xFF."""
         expected_lo = expected_cmd & 0xFF
         expected_hi = (expected_cmd >> 8) & 0xFF
         last_resp = b""
-        for attempt in range(retries):
+        for _ in range(retries):
+            resp = b""
             try:
                 resp = self.raw_get()
                 last_resp = resp
-                if len(resp) >= 4 and resp[0] == expected_lo and resp[1] == expected_hi and resp[3] == 0x01:
-                    return resp
             except Exception:
                 pass
+            if len(resp) >= 4 and resp[0] == expected_lo and resp[1] == expected_hi:
+                if resp[3] == 0xFF:
+                    raise McuRejectedError(
+                        f"MCU rejected cmd {expected_cmd:#06x} with status 0xFF. "
+                        f"Raw response: {resp.hex()}"
+                    )
+                if resp[3] == 0x01:
+                    # Wait after GET_REPORT so the MCU main loop finishes transitioning
+                    # (State 0 Phase 2 -> State 2, or State 3 -> State 0) before the
+                    # next SET_REPORT overwrites hid_buf (0x2000135C).
+                    if settle:
+                        time.sleep(settle)
+                    return resp
             time.sleep(delay)
         raise RuntimeError(f"MCU did not ACK cmd {expected_cmd:#06x}. Last resp: {last_resp.hex() if last_resp else 'None'}")
 
-    # ---- verified: general settings (fn switch / sleep timer / key response) ----
+    # ---- verified: general settings (Alt+Tab / Alt+F4 / Win-Lock / fn switch / sleep / response) ----
     def write_general_settings(
         self,
         fn_switch: int = 0,
         sleep_time: int = 0,
         key_response_time: int = 0,
-        fn_enabled: bool = False,
-        sleep_enabled: bool = False,
-        key_response_enabled: bool = False,
+        disable_alt_tab: bool = False,
+        disable_alt_f4: bool = False,
+        win_lock: bool = False,
         verify: bool = True,
     ) -> bytes:
         """
-        Replicates the exact sequence captured from the official driver
-        (decompiled function FUN_004141a0) when it saves the "fn layer / sleep
-        timer / key response time" settings panel.
+        Write general settings to flash page 0x00009000 via 0x1704 and verify the
+        32-bit little-endian commit checksum over all 64 written bytes.
         """
-        final_resp = b""
+        # 1) open/ping
+        self.send_cmd(CMD_OPEN)
+        self._wait_ack(CMD_OPEN)
 
-        # Loop through both Profile 0 (Wired) and Profile 1 (Wireless)
-        for profile_index in (0, 1):
-            # 1) open/ping
-            self.send_cmd(CMD_OPEN)
-            self._wait_ack(CMD_OPEN)
+        # 2) probe 0x1704 (flash 0x00009000; firmware ignores profile index bytes)
+        self.send_cmd(CMD_SETTINGS_WRITE, bytes([1, 0, 0, 0, 0, 0, 1]))
+        self._wait_ack(CMD_SETTINGS_WRITE)
 
-            # 2) fixed probe (profile_index selects which profile's settings
-            #    the following write applies to)
-            self.send_cmd(CMD_PROBE, bytes([1, profile_index, 0, 0, 0, 0, 1]))
-            self._wait_ack(CMD_PROBE)
+        # 3) the actual settings write (64-byte payload)
+        body = bytes([
+            1 if disable_alt_tab else 0,
+            1 if disable_alt_f4 else 0,
+            1 if win_lock else 0,
+            fn_switch & 0xFF,
+            sleep_time & 0xFF,
+            0,  # unused gap byte, always 0 in captures
+            key_response_time & 0xFF,
+        ])
+        payload = bytes(build_report(CMD_GENERAL_SETTINGS, body, trailer=True))
+        self.raw_send(payload)
+        time.sleep(0.05)
 
-            # 3) the actual settings write
-            body = bytes([
-                1 if fn_enabled else 0,
-                1 if sleep_enabled else 0,
-                1 if key_response_enabled else 0,
-                fn_switch & 0xFF,
-                sleep_time & 0xFF,
-                0,  # unused gap byte, always 0 in captures
-                key_response_time & 0xFF,
-            ])
-            self.send_cmd(CMD_GENERAL_SETTINGS, body, trailer=True)
+        # 4) commit / read back
+        self.send_cmd(CMD_COMMIT, delay=0.036)
+        try:
+            resp = self._wait_ack(CMD_COMMIT)
+        except RuntimeError as e:
+            raise RuntimeError(
+                f"Device never returned a ready response after general settings commit: {e}"
+            ) from e
 
-            # 4) commit / read back
-            self.send_cmd(CMD_COMMIT)
-            try:
-                resp = self._wait_ack(CMD_COMMIT)
-            except RuntimeError as e:
+        if verify:
+            expected = sum(payload) & 0xFFFFFFFF
+            got = parse_commit_checksum(resp)
+            if got != expected:
                 raise RuntimeError(
-                    f"Device never returned a ready response after commit on "
-                    f"profile {profile_index}: {e}"
-                ) from e
+                    f"Write-back 32-bit checksum mismatch on general settings: "
+                    f"expected {expected:#010x}, device returned {got:#010x}. "
+                    f"Raw response: {resp.hex()}"
+                )
+        return resp
 
-            if verify:
-                expected = (fn_switch + sleep_time + key_response_time) & 0xFF
-                got = resp[4]
-                if got != expected:
-                    raise RuntimeError(
-                        f"Write-back checksum mismatch on profile {profile_index}: "
-                        f"expected {expected:#04x}, device returned {got:#04x}. "
-                        f"Raw response: {resp.hex()}"
-                    )
-            final_resp = resp
-
-        return final_resp
-
-    def set_key_response_time(self, value: int, sleep_time: int = 0, fn_switch: int = 0) -> bytes:
+    def set_key_response_time(
+        self,
+        value: int,
+        sleep_time: int = 0,
+        fn_switch: int = 0,
+        disable_alt_tab: bool = False,
+        disable_alt_f4: bool = False,
+        win_lock: bool = False,
+    ) -> bytes:
         return self.write_general_settings(
-            fn_switch=fn_switch, sleep_time=sleep_time, key_response_time=value
+            fn_switch=fn_switch,
+            sleep_time=sleep_time,
+            key_response_time=value,
+            disable_alt_tab=disable_alt_tab,
+            disable_alt_f4=disable_alt_f4,
+            win_lock=win_lock,
         )
 
-    def set_sleep_time(self, value: int, key_response_time: int = 0, fn_switch: int = 0) -> bytes:
+    def set_sleep_time(
+        self,
+        value: int,
+        key_response_time: int = 0,
+        fn_switch: int = 0,
+        disable_alt_tab: bool = False,
+        disable_alt_f4: bool = False,
+        win_lock: bool = False,
+    ) -> bytes:
         return self.write_general_settings(
-            fn_switch=fn_switch, sleep_time=value, key_response_time=key_response_time
+            fn_switch=fn_switch,
+            sleep_time=value,
+            key_response_time=key_response_time,
+            disable_alt_tab=disable_alt_tab,
+            disable_alt_f4=disable_alt_f4,
+            win_lock=win_lock,
         )
 
-    def _write_lighting_sequence(self, payload: bytearray):
+    def _write_lighting_sequence(self, payload: bytearray | bytes, verify: bool = True):
         """Internal helper: Open → Probe(0x1304) → Payload → Commit → Finalize.
 
         Commit polling: PROTOCOL.md §2 documents that the MCU can return
         all-zeros during flash housekeeping while the write is still being
         applied.  A commit-poll timeout is therefore a soft warning, not a
-        hard error — the lighting write has already been applied.  This
-        mirrors the identical treatment in sync_rtc().
+        hard error — the lighting write has already been applied.
         """
+        payload_bytes = bytes(payload)
         self.send_cmd(CMD_OPEN)
         self._wait_ack(CMD_OPEN)
 
-        self.send_cmd(0x1304, bytes([0, 0, 0, 0, 0, 0, 1]))
-        self._wait_ack(0x1304)
+        self.send_cmd(CMD_LIGHTING_WRITE, bytes([0, 0, 0, 0, 0, 0, 1]))
+        self._wait_ack(CMD_LIGHTING_WRITE)
 
-        self.raw_send(payload)
+        self.raw_send(payload_bytes)
         time.sleep(0.05)
 
-        self.send_cmd(CMD_COMMIT)
+        self.send_cmd(CMD_COMMIT, delay=0.036)
+        ack_valid = True
+        ack = b""
         try:
-            self._wait_ack(CMD_COMMIT, retries=60, delay=0.05)
+            ack = self._wait_ack(CMD_COMMIT, retries=60, delay=0.05)
+        except McuRejectedError:
+            raise
         except RuntimeError as e:
-            # PROTOCOL.md §2: "An all-zeros status buffer during commit polling
-            # has also been seen when the MCU was busy with flash housekeeping —
-            # patience and retry, not abandonment."  After 3 s of retries we
-            # accept the timeout: lighting writes whose commit reads 0x00 have
-            # been confirmed to apply anyway.  Raise only if the response was
-            # NOT all-zeros (genuinely unexpected).
             resp = self.raw_get()
             if resp and any(b != 0 for b in resp):
                 raise  # non-zero unexpected content — real error, re-raise
@@ -427,6 +507,17 @@ class AulaS75Pro:
                 "MCU is busy with flash housekeeping — lighting write has "
                 "applied (PROTOCOL.md §2, verified behaviour)."
             )
+            ack_valid = False
+
+        if ack_valid and verify:
+            expected = sum(payload_bytes) & 0xFFFFFFFF
+            got = parse_commit_checksum(ack)
+            if got != expected:
+                raise RuntimeError(
+                    f"Lighting write 32-bit checksum mismatch: "
+                    f"expected {expected:#010x}, MCU returned {got:#010x}. "
+                    f"Raw response: {ack.hex()}"
+                )
 
         self.send_cmd(CMD_FINALIZE)
         time.sleep(0.1)
@@ -514,8 +605,8 @@ class AulaS75Pro:
         table[574] = 0xAA
         table[575] = 0x55
 
-        # Pre-compute the 16-bit checksum for verify step (PROTOCOL.md §5).
-        expected_checksum = sum(table) & 0xFFFF
+        # Compute full 32-bit byte-sum checksum returned in CMD_COMMIT resp[4..7].
+        expected_checksum = sum(table) & 0xFFFFFFFF
 
 
         def _run_once():
@@ -546,8 +637,11 @@ class AulaS75Pro:
             # Commit: send then wait ~35 ms before polling the ACK.
             self.send_cmd(CMD_COMMIT, delay=0.0)
             time.sleep(0.035)
+            ack_valid = True
             try:
                 ack = self._wait_ack(CMD_COMMIT, retries=60, delay=0.05)
+            except McuRejectedError:
+                raise
             except RuntimeError as e:
                 # Same soft-error path as _write_lighting_sequence: all-zeros
                 # during flash housekeeping is expected and the write applies.
@@ -557,24 +651,30 @@ class AulaS75Pro:
                 print(
                     f"warning: custom table commit poll timed out ({e}); "
                     "MCU busy with flash housekeeping — table write has "
-                    "applied (PROTOCOL.md §5, verified behaviour)."
+                    "applied (PROTOCOL.md §5, verified behaviour). "
+                    "Skipping checksum verification (ACK was all-zeros)."
                 )
-                ack = ack or b""
+                ack_valid = False
 
-            # Checksum verification (PROTOCOL.md §5: ack[4:6] = 16-bit LE sum)
-            if len(ack) >= 6:
-                mcu_checksum = ack[4] | (ack[5] << 8)
-                if mcu_checksum != expected_checksum:
-                    print(
-                        f"warning: table checksum mismatch — "
-                        f"host computed {expected_checksum:#06x}, "
-                        f"MCU returned {mcu_checksum:#06x}. "
-                        "The upload may have been corrupted; consider retrying."
-                    )
+            # Checksum verification (resp[4..7] = 32-bit LE sum).
+            # Only checked when _wait_ack returned a real ACK: an all-zeros
+            # flash-housekeeping response carries no meaningful checksum and
+            # would produce a false "mismatch" warning against 0x00000000.
+            if ack_valid:
+                if len(ack) >= 8:
+                    mcu_checksum = parse_commit_checksum(ack)
+                    if mcu_checksum != expected_checksum:
+                        print(
+                            f"warning: table checksum mismatch — "
+                            f"host computed {expected_checksum:#010x}, "
+                            f"MCU returned {mcu_checksum:#010x}. "
+                            "The upload may have been corrupted; consider retrying."
+                        )
+                    else:
+                        print(f"Custom table checksum OK ({mcu_checksum:#010x}).")
                 else:
-                    print(f"Custom table checksum OK ({mcu_checksum:#06x}).")
-            else:
-                print("warning: ACK response too short to read checksum.")
+                    print("warning: ACK response too short to read checksum.")
+
 
             # Finalize: ~35 ms after commit ACK (PROTOCOL.md §5 step 11)
             time.sleep(0.035)
@@ -650,5 +750,288 @@ class AulaS75Pro:
         if len(resp) >= 4 and resp[3] != 0x01:
             print(f"warning: commit status {resp[3]:#04x} (capture saw 0x01); "
                   "the RTC write appears to apply anyway - check the TFT clock.")
+
+    # ---- State-1 read helpers & firmware info/battery/underglow -------------
+    def _read_state1_chunks(
+        self,
+        cmd: int,
+        chunks: int = 1,
+        *,
+        delay: float = 0.036,
+        verify: bool = True,
+        is_live_ram: bool = False,
+    ) -> tuple[list[bytes], int]:
+        """Execute a State-1 read transaction (0x0504, 0x1004, 0x1204, 0x1404, 0x1604, 0x2204, 0x2604, 0xF504).
+
+        Handles both firmware paths from 0x00004330 + FUN_0000407a:
+          - Stale usb_flags bit 1: SET_REPORT auto-advances to State 1 and
+            FUN_0000407a preloads chunk 0 before the first GET_REPORT, so GET #1
+            returns chunk 0 directly.
+          - Clean usb_flags bit 1 (after 0x0204+GET, or for 0xF504 which clears
+            bit 1 in Phase 1): GET #1 returns [04, cmd_hi, 00, 01, ...], then
+            chunks 0..N-1 follow on subsequent GET_REPORTs.
+        """
+        if chunks < 1:
+            raise ValueError(f"chunks must be >= 1, got {chunks}")
+
+        exp_lo = cmd & 0xFF
+        exp_hi = (cmd >> 8) & 0xFF
+        probe = bytes(
+            build_report(cmd, bytes([0, 0, 0, 0, 0, 0, chunks & 0xFF, (chunks >> 8) & 0xFF]))
+        )
+        self.raw_send(probe)
+        if delay:
+            time.sleep(delay)
+
+        resp1 = self.raw_get()
+        is_cmd_echo = len(resp1) >= 4 and resp1[0] == exp_lo and resp1[1] == exp_hi
+        if is_cmd_echo and resp1[3] == 0xFF:
+            raise McuRejectedError(
+                f"MCU returned 0xFF (rejected/busy) on read cmd {cmd:#06x}. Raw: {resp1.hex()}"
+            )
+
+        data_chunks: list[bytes] = []
+        if is_cmd_echo and resp1[3] == 0x01:
+            for _ in range(chunks):
+                if delay:
+                    time.sleep(delay)
+                data_chunks.append(self.raw_get())
+        else:
+            data_chunks.append(resp1)
+            for _ in range(1, chunks):
+                if delay:
+                    time.sleep(delay)
+                data_chunks.append(self.raw_get())
+
+        # Let the final chunk's GET_REPORT bit-1 flag settle in FUN_0000407a
+        # (preloading any trailing block and transitioning State 1 -> State 3)
+        # before SET 0x0204 writes hid_buf, otherwise FUN_0000407a can clobber
+        # 04 02 with trailing flash data and cause State 3 to return 0xFF.
+        if delay:
+            time.sleep(delay)
+
+        self.raw_send(bytes(build_report(CMD_COMMIT)))
+        if delay:
+            time.sleep(delay)
+        # Allow State 3 (0x00003E94-0x00003EA8) to finish clearing usb_flags = 0
+        # and return to State 0 before an immediate follow-up command runs.
+        commit_resp = self._wait_ack(CMD_COMMIT, retries=20, delay=delay, settle=delay)
+        mcu_sum = parse_commit_checksum(commit_resp)
+
+        if verify:
+            if is_live_ram:
+                if mcu_sum != 0:
+                    raise RuntimeError(
+                        f"Live RGB RAM commit checksum mismatch for {cmd:#06x}: "
+                        f"expected 0x00000000, MCU returned {mcu_sum:#010x}."
+                    )
+            else:
+                host_sum = sum(sum(c) for c in data_chunks)
+                if not (host_sum <= mcu_sum <= host_sum + 64 * 0xFF):
+                    raise RuntimeError(
+                        f"Flash read commit checksum out of range for {cmd:#06x}: "
+                        f"host chunk sum={host_sum:#010x}, MCU returned {mcu_sum:#010x} "
+                        f"(expected [{host_sum:#010x}, {host_sum + 64 * 0xFF:#010x}])."
+                    )
+
+        return data_chunks, mcu_sum
+
+    @staticmethod
+    def _unpack_rgb_slots(raw: bytes, *, skip_zero_slot: bool) -> dict[int, tuple[int, int, int]]:
+        keys: dict[int, tuple[int, int, int]] = {}
+        for slot_idx in range(len(raw) // 4):
+            off = slot_idx * 4
+            if raw[off] == slot_idx and (not skip_zero_slot or slot_idx > 0):
+                keys[slot_idx] = (raw[off + 1], raw[off + 2], raw[off + 3])
+        return keys
+
+    def read_device_info(self) -> dict:
+        """Read firmware/device info block from flash 0x00008F80 via CMD_DEVICE_INFO (0x0504)."""
+        chunks, mcu_sum = self._read_state1_chunks(CMD_DEVICE_INFO, chunks=1)
+        chunk = chunks[0]
+        tag = struct.unpack_from("<H", chunk, 0)[0]
+        vid = struct.unpack_from("<H", chunk, 4)[0]
+        pid = struct.unpack_from("<H", chunk, 6)[0]
+        fw_minor = chunk[8]
+        fw_major = chunk[9]
+        return {
+            "tag": tag,
+            "vid": vid,
+            "pid": pid,
+            "fw_major": fw_major,
+            "fw_minor": fw_minor,
+            "fw_version": f"{fw_major}.{fw_minor:02d}",
+            "checksum": mcu_sum,
+            "raw": chunk,
+        }
+
+    def read_battery_level(self, delay: float = 0.036) -> dict:
+        """Read quantized battery level (0-5) from RAM 0x200000F8 via CMD_BATTERY_LEVEL (0xF604)."""
+        self.raw_send(bytes(build_report(CMD_BATTERY_LEVEL)))
+        if delay:
+            time.sleep(delay)
+        resp = self.raw_get()
+        exp_lo = CMD_BATTERY_LEVEL & 0xFF
+        exp_hi = (CMD_BATTERY_LEVEL >> 8) & 0xFF
+        if len(resp) < 5 or resp[0] != exp_lo or resp[1] != exp_hi:
+            raise RuntimeError(
+                f"Unexpected response for CMD_BATTERY_LEVEL (0xF604): {resp.hex()}"
+            )
+        if resp[3] == 0xFF:
+            raise McuRejectedError(f"MCU rejected 0xF604 battery query: {resp.hex()}")
+        if resp[3] != 0x01:
+            raise RuntimeError(
+                f"Unexpected status 0x{resp[3]:02x} for 0xF604 battery query: {resp.hex()}"
+            )
+        level = resp[4]
+        return {
+            "level": level,
+            "percent_range": BATTERY_RANGES.get(level, "unknown"),
+            "raw": resp,
+        }
+
+    def read_lighting_config(self) -> dict:
+        """Read saved main-key lighting config from flash 0x00009800 via CMD_LIGHTING_READ (0x1204)."""
+        chunks, mcu_sum = self._read_state1_chunks(CMD_LIGHTING_READ, chunks=1)
+        chunk = chunks[0]
+        return {
+            "raw": chunk,
+            "erased": all(b == 0xFF for b in chunk),
+            "zeroed": all(b == 0x00 for b in chunk),
+            "effect": chunk[0],
+            "rgb": (chunk[1], chunk[2], chunk[3]),
+            "option": chunk[8],
+            "brightness": chunk[9],
+            "speed": chunk[10],
+            "direction": chunk[11],
+            "trailer": chunk[14:16],
+            "checksum": mcu_sum,
+        }
+
+    def read_general_settings(self) -> dict:
+        """Read saved general settings page from flash 0x00009000 via CMD_SETTINGS_READ (0x1604)."""
+        chunks, mcu_sum = self._read_state1_chunks(CMD_SETTINGS_READ, chunks=1)
+        chunk = chunks[0]
+        sleep_time = chunk[6]
+        key_resp = chunk[8]
+        return {
+            "raw": chunk,
+            "erased": all(b == 0xFF for b in chunk),
+            "zeroed": all(b == 0x00 for b in chunk),
+            "disable_alt_tab": bool(chunk[2]),
+            "disable_alt_f4": bool(chunk[3]),
+            "win_lock": bool(chunk[4]),
+            "fn_switch": chunk[5],
+            "sleep_time": sleep_time,
+            "sleep_label": SLEEP_TIME_LABELS.get(sleep_time, "unknown"),
+            "key_response_time": key_resp,
+            "debounce_scans": DEBOUNCE_SCANS.get(key_resp, 3),
+            "checksum": mcu_sum,
+        }
+
+    def read_live_rgb(self, chunks: int = TABLE_CHUNKS) -> dict:
+        """Read live RGB RAM arrays (0x20001838/195E/1A84) via CMD_LIGHT_READ (0xF504)."""
+        raw_chunks, mcu_sum = self._read_state1_chunks(
+            CMD_LIGHT_READ, chunks=chunks, is_live_ram=True
+        )
+        raw = b"".join(raw_chunks)
+        return {
+            "keys": self._unpack_rgb_slots(raw, skip_zero_slot=False),
+            "checksum": mcu_sum,
+            "raw": raw,
+        }
+
+    def read_custom_lighting_table(self, chunks: int = TABLE_CHUNKS) -> dict:
+        """Read saved custom RGB table from flash 0x00009C00 via CMD_CUSTOM_LIGHT_READ (0x2204)."""
+        raw_chunks, mcu_sum = self._read_state1_chunks(CMD_CUSTOM_LIGHT_READ, chunks=chunks)
+        raw = b"".join(raw_chunks)
+        return {
+            "keys": self._unpack_rgb_slots(raw, skip_zero_slot=True),
+            "trailer": raw[-2:],
+            "checksum": mcu_sum,
+            "raw": raw,
+        }
+
+    def set_underglow_mode(self, mode: int | str, preserve_lighting: bool = True) -> dict:
+        """
+        Set Row-6 side / underglow lighting mode (0=flowing, 1=spectrum, 2=static,
+        3=breathing, 4=off) via CMD_LIGHTING_WRITE (0x1304, payload[0] = 0x20 + mode).
+
+        Because 0x1304 Phase 1 erases flash page 0x00009800 before FUN_00003f42
+        skips writing it for 0x20-0x24, preserve_lighting=True (default) reads
+        0x9800 via 0x1204 beforehand and rewrites it afterward if populated.
+        """
+        if isinstance(mode, bool):
+            raise ValueError(f"Invalid underglow mode: {mode!r}")
+        if isinstance(mode, str):
+            key = mode.strip().lower()
+            if key in UNDERGLOW_MODES:
+                mode_id = UNDERGLOW_MODES[key]
+            elif key.isdigit():
+                mode_id = int(key)
+            else:
+                raise ValueError(
+                    f"Unknown underglow mode {mode!r}; "
+                    f"expected {', '.join(UNDERGLOW_MODES)} or 0-4."
+                )
+        elif isinstance(mode, int):
+            mode_id = mode
+        else:
+            raise ValueError(f"Invalid underglow mode type: {type(mode).__name__}")
+
+        if not (0 <= mode_id <= 4):
+            raise ValueError(f"Underglow mode must be 0-4, got {mode_id}")
+
+        saved = self.read_lighting_config() if preserve_lighting else None
+
+        self.send_cmd(CMD_OPEN, delay=0.036)
+        self._wait_ack(CMD_OPEN)
+
+        self.send_cmd(CMD_LIGHTING_WRITE, bytes([0, 0, 0, 0, 0, 0, 1]), delay=0.036)
+        self._wait_ack(CMD_LIGHTING_WRITE)
+
+        payload = bytearray(REPORT_LEN)
+        payload[0] = 0x20 + mode_id
+        self.raw_send(bytes(payload))
+        # Give FUN_00003f42 / FUN_0000df18() time to update flash 0x8000 and
+        # transition State 2 -> State 3 before sending CMD_COMMIT (0x0204).
+        time.sleep(0.12)
+
+        self.send_cmd(CMD_COMMIT, delay=0.0)
+        time.sleep(0.05)
+        commit_resp = self._wait_ack(CMD_COMMIT, retries=20, delay=0.05)
+        mcu_sum = parse_commit_checksum(commit_resp)
+        checksum_matched = mcu_sum == EXPECTED_UNDERGLOW_ERASED_CHECKSUM
+        if not checksum_matched:
+            warnings.warn(
+                f"Underglow commit checksum 0x{mcu_sum:08x} != expected "
+                f"0x{EXPECTED_UNDERGLOW_ERASED_CHECKSUM:08x} "
+                "(firmware may have shifted uninitialized stack word).",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        # Persist 0x20000194 underglow mode into flash 0x8000 and unblank LEDs.
+        self.send_cmd(CMD_FINALIZE, delay=0.0)
+        time.sleep(0.1)
+
+        restored = False
+        if (
+            saved is not None
+            and not saved["erased"]
+            and not saved["zeroed"]
+            and (saved["raw"][0] >> 4) != 2
+        ):
+            time.sleep(0.2)
+            self._write_lighting_sequence(bytearray(saved["raw"]), verify=True)
+            restored = True
+
+        return {
+            "mode": mode_id,
+            "mode_name": UNDERGLOW_MODE_NAMES[mode_id],
+            "checksum": mcu_sum,
+            "checksum_matched": checksum_matched,
+            "restored_lighting": restored,
+        }
 
 

@@ -13,29 +13,32 @@ Reverse-engineered from USB/HID traffic captures (usbmon + Wireshark).
 └────────────────────────────────────────────────────────────────────────┘
 
 ┌─ Wire protocol ─────────────────────────────────────────────────────────┐
-│  EP0  SET_REPORT [Feature] → cmd_begin  (04 18 00…)                    │
+│  EP0  SET_REPORT [Feature] → cmd_begin  (04 18 00…)                     │
 │  EP0  GET_REPORT [Feature] ← ack                                        │
-│  EP0  SET_REPORT [Feature] → cmd_upload (04 72 <mode> 00… <chunks> …)  │
-│         mode: 0x03 = still image,  0x05 = animated GIF                 │
-│         chunks = N_frames × 16                                          │
+│  EP0  SET_REPORT [Feature] → cmd_upload (04 72 <mode> 00… <chunks> …)   │
+│         note: cmd[2] (0x03/0x05) is ignored by firmware 0x000045D4;     │
+│         chunks = ceil((256 + N_frames × 64800) / 4096)                  │
 │  EP0  GET_REPORT [Feature] ← ack                                        │
-│  ×(N_frames×16):                                                        │
+│  ×chunks:                                                               │
 │    EP 0x03  write(4096 bytes)  → image chunk                            │
-│    EP 0x84  read (64 bytes)    ← ack  01 5A 02 00…                     │
-│  EP0  SET_REPORT [Feature] → cmd_end   (04 02 00…)                     │
-└────────────────────────────────────────────────────────────────────────┘
+│    EP 0x84  read (64 bytes)    ← ack  01 5A 02 00…                      │
+│  EP0  SET_REPORT [Feature] → cmd_end   (04 02 00…)                      │
+└─────────────────────────────────────────────────────────────────────────┘
 
-┌─ Transfer buffer layout  (N_frames × 16 × 4096 bytes) ─────────────────┐
-│  [N_frames]  [delay_0] … [delay_{N-1}]  [0xFF × (255-N)]   256 bytes  │
-│  [frame_0 pixels: 64 800 bytes = 240×135×2]                             │
+┌─ Transfer buffer layout  (ceil((256 + N_frames × 64800) / 4096) × 4096) ┐
+│  [N_frames]  [delay_0] … [delay_{N-1}]  [0xFF × (255-N)]   256 bytes    │
+│  [frame_0 pixels: 64 800 bytes = 135×240×2]                             │
 │  [frame_1 pixels: 64 800 bytes]                                         │
 │  …                                                                      │
 │  [frame_{N-1} pixels: 64 800 bytes]                                     │
-│  [0xFF × tail]    tail = 736·N − 256                                    │
-│                                                                          │
-│  delay unit: centiseconds (same as GIF spec), value capped to 255.      │
-│  Still image uses delay=0x19=25 cs (default, not displayed).            │
-└────────────────────────────────────────────────────────────────────────┘
+│  [0xFF × tail]    pads total transfer to a multiple of 4096 bytes       │
+│                                                                         │
+│  delay unit: 2 ms wire ticks (0x10..0xFF = 32..510 ms). Values < 0x10   │
+│  are silently replaced with 0x19 (50 ms) by firmware FUN_00011a84.      │
+│  Max N_frames = 191 (0xC0 - 1): MCU reads 192 B (0xC0) into RAM         │
+│  0x200021DA; > 191 frames overflows past 0x20002299 into fuel-gauge RAM.│
+│  Still image uses delay=0x19=25 ticks (50 ms).                         │
+└─────────────────────────────────────────────────────────────────────────┘
 
 Transport: pyusb only. An experimental hidapi backend was tried and dropped -
 sending the image-chunk data as a HID Output Report over hidapi got the
@@ -69,8 +72,8 @@ udev rule (so you can run without sudo):
 Usage:
     python3 aula_s75pro_screen.py photo.jpg          # still image
     python3 aula_s75pro_screen.py photo.jpg --fit    # letterbox to fit
-    python3 aula_s75pro_screen.py anim.gif           # animated GIF (all frames)
-    python3 aula_s75pro_screen.py anim.gif --delay 50  # override frame delay (cs)
+    python3 aula_s75pro_screen.py anim.gif           # animated GIF (up to 191 frames)
+    python3 aula_s75pro_screen.py anim.gif --delay 50  # override frame delay (ms, 32-510)
     python3 aula_s75pro_screen.py clip.mp4           # video, auto-converted
     python3 aula_s75pro_screen.py clip.mp4 --fps 10 --max-frames 60
     python3 aula_s75pro_screen.py --test-color red   # solid colour test
@@ -82,6 +85,7 @@ import math
 import struct
 import sys
 import time
+import warnings
 from pathlib import Path
 
 # ── Device constants ──────────────────────────────────────────────────────────
@@ -91,8 +95,12 @@ PRODUCT_ID = 0x800A
 SCREEN_W   = 135   # portrait: 135 px wide
 SCREEN_H   = 240   # portrait: 240 px tall
 CHUNK_SIZE = 4096           # bytes per interrupt-OUT transfer
-PREAMBLE   = 256            # header at start of the whole buffer
+PREAMBLE   = 256            # SPI flash header size before pixel_0 at 0x750100
 PIXEL_BYTES = SCREEN_W * SCREEN_H * 2  # 64 800  (135×240×2)
+# Firmware FUN_00010460(0x750000) calls FUN_00007882(0x750000, 0xC0), copying only
+# 192 bytes (0xC0) into RAM 0x200021DA: byte 0 = N_frames, bytes 1..191 = 191 delay
+# slots. Uploading >= 192 frames reads past 0x20002299 into fuel-gauge RAM (0x200022A0+).
+MAX_FRAMES = 191            # 0xC0 - 1
 
 # HID endpoints (confirmed from captures)
 HID_IFACE  = 3
@@ -110,29 +118,28 @@ W_VALUE    = 0x0300  # Feature report, id=0
 CMD_BEGIN = bytes([0x04, 0x18]) + bytes(62)
 CMD_END   = bytes([0x04, 0x02]) + bytes(62)
 
-DEFAULT_STILL_DELAY = 0x19   # 25 cs — default for single-frame; value is irrelevant
+# Clock-tree verified firmware tick rate (`s75pro_fw_v1.03.bin`):
+#   1. FUN_00013bfa configures PLL = 48 MHz, HCLK div 1.
+#   2. FUN_00006f8c sets SysTick RVR = 23999 (0x5DBF) -> 0.5 ms SysTick IRQ (FUN_00006f9c).
+#   3. FUN_000008e2 derives pbVar2[2] = 2 ms (every 4 SysTicks).
+#   4. FUN_00011a84 ticks GIF frame hold durations on pbVar2[2] = 2 ms.
+# DeviceDriver.exe.c:30483 stores GIF delays in milliseconds and divides by 2.
+WIRE_TICK_MS = 2
+MIN_WIRE_DELAY = 0x10                       # 16 ticks = 32 ms (FUN_00011a84 overrides < 0x10 to 0x19)
+MAX_WIRE_DELAY = 0xFF                       # 255 ticks = 510 ms
+MIN_DELAY_MS = MIN_WIRE_DELAY * WIRE_TICK_MS  # 32 ms
+MAX_DELAY_MS = MAX_WIRE_DELAY * WIRE_TICK_MS  # 510 ms
+DEFAULT_STILL_DELAY = 0x19                  # 25 ticks = 50 ms — default for single-frame
 
-# Each preamble delay byte represents this many milliseconds of on-screen hold
-# time - NOT 10ms (one GIF-spec centisecond) as originally assumed.
-#
-# Evidence, from the same decompiled function as the chunk-count fix
-# (FUN_00422ac0): for each frame, the driver takes its internal duration
-# value (a GIF-frame object field, almost certainly in native GIF centiseconds)
-# and HALVES it, floored at 1, before writing it as the wire byte:
-#
-#     uVar7 = 1;
-#     if (1 < native_duration_field / 2)
-#         uVar7 = (char)(native_duration_field / 2);
-#
-# If wire ticks were 10ms (=1 native cs), that halving would make every
-# animation play back at 2x the intended speed. For playback to match the
-# source GIF's actual timing, each wire tick must therefore be 2x a native
-# centisecond, i.e. 20ms. NOT independently verified against real hardware
-# (no animated-upload capture was available) - if your uploaded animations
-# still look wrong after this change, that's the thing to check with a
-# stopwatch: a single frame at a known real-world delay (e.g. exactly 1
-# second) is the cleanest test.
-WIRE_TICK_MS = 20
+
+def clamp_wire_delay(ticks: int) -> int:
+    """Clamp raw wire delay ticks to firmware range 0x10..0xFF (32..510 ms)."""
+    return max(MIN_WIRE_DELAY, min(MAX_WIRE_DELAY, int(ticks)))
+
+
+def ms_to_wire_delay(ms: float) -> int:
+    """Convert milliseconds to clamped 2 ms firmware wire ticks (0x10..0xFF)."""
+    return clamp_wire_delay(round(ms / WIRE_TICK_MS))
 
 
 def total_chunks_needed(n_frames: int) -> int:
@@ -157,14 +164,20 @@ def total_chunks_needed(n_frames: int) -> int:
 # ── Protocol helpers ──────────────────────────────────────────────────────────
 def make_cmd_upload(n_frames: int) -> bytes:
     """
-    Build the 64-byte cmd_upload packet.
-      B1    = 0x72   upload command
-      B2    = 0x03   still image  |  0x05  animated GIF
+    Build the 64-byte cmd_upload packet (0x7204).
+      B1    = 0x72   upload command (writes external SPI flash at 0x00750000)
+      B2    = 0x03   still / 0x05 animated — ignored by firmware 0x000045D4
+                     (retained for vendor-driver wire parity; MCU checks N_frames
+                     at SPI 0x00750000 instead)
       B8-B9 = total chunk count as 16-bit little-endian.
-              Must equal total_chunks_needed(n_frames) - NOT n_frames*16 -
-              see that function's docstring for why they diverge at n>=6.
+              Must equal total_chunks_needed(n_frames).
     """
-    mode   = 0x03 if n_frames == 1 else 0x05
+    if not (1 <= n_frames <= MAX_FRAMES):
+        raise ValueError(
+            f"Frame count must be 1–{MAX_FRAMES} (MCU copies only 0xC0=192 preamble bytes "
+            f"into RAM 0x200021DA..0x20002299), got {n_frames}."
+        )
+    mode   = 0x03 if n_frames == 1 else 0x05  # ignored by 0x000045D4; wire parity only
     chunks = total_chunks_needed(n_frames)
     if chunks > 0xFFFF:
         raise ValueError(f"Frame count {n_frames} produces {chunks} chunks, "
@@ -178,37 +191,61 @@ def make_cmd_upload(n_frames: int) -> bytes:
     return bytes(cmd)
 
 
-def build_buffer(frames_rgb565: list, delays_cs: list) -> bytes:
+def build_buffer(frames_rgb565: list, delays: list) -> bytes:
     """
-    Assemble the complete transfer buffer for N frames.
+    Assemble the complete transfer buffer for N frames (1 <= N <= MAX_FRAMES = 191).
 
     frames_rgb565 : list of bytes objects, each PIXEL_BYTES long
-    delays_cs     : list of int, per-frame delay in centiseconds (0–255)
+    delays        : list of int, per-frame hold duration in 2 ms wire ticks
+                    (clamped to 0x10..0xFF = 32..510 ms)
 
     Buffer layout:
-        [N] [d0] [d1] … [d_{N-1}] [0xFF × (255-N)]   ← 256-byte preamble
-        [frame_0]                                       ← 64 800 bytes
+        [N] [d0] [d1] … [d_{N-1}] [0xFF × (255-N)]   ← 256-byte flash preamble (0x750000)
+        [frame_0]                                       ← 64 800 bytes (starts at 0x750100)
         [frame_1]                                       ←  "
         …
         [frame_{N-1}]
         [0xFF × tail]     ← pads to total_chunks_needed(n)*4096 bytes total
     """
     n = len(frames_rgb565)
-    assert n == len(delays_cs), "frames and delays must be same length"
-    assert 1 <= n <= 254, f"Frame count must be 1–254, got {n}"
+    if n != len(delays):
+        raise ValueError(f"frames ({n}) and delays ({len(delays)}) must have the same length")
+    if not (1 <= n <= MAX_FRAMES):
+        raise ValueError(
+            f"Frame count must be 1–{MAX_FRAMES} (0xC0 - 1; >191 overflows past "
+            f"0x20002299 into fuel-gauge RAM), got {n}."
+        )
 
     total = total_chunks_needed(n) * CHUNK_SIZE
     tail_len = total - PREAMBLE - n * PIXEL_BYTES
-    assert tail_len >= 0, "Internal error: negative tail"
+    if tail_len < 0:
+        raise ValueError("Internal error: negative tail")
+
+    clamped_delays = []
+    out_of_range = False
+    for d in delays:
+        di = int(d)
+        cd = clamp_wire_delay(di)
+        if cd != di:
+            out_of_range = True
+        clamped_delays.append(cd)
+    if out_of_range:
+        warnings.warn(
+            f"Clamped frame delay(s) to firmware range 0x{MIN_WIRE_DELAY:02X}–0x{MAX_WIRE_DELAY:02X} "
+            f"ticks ({MIN_DELAY_MS}–{MAX_DELAY_MS} ms; < 0x10 is overridden to 0x19 = 50 ms by firmware).",
+            UserWarning,
+            stacklevel=2,
+        )
 
     # Preamble: [N_frames][delay_0..delay_{N-1}][0xFF padding]
-    preamble = bytes([n] + [min(255, d) for d in delays_cs] + [0xFF] * (255 - n))
+    preamble = bytes([n] + clamped_delays + [0xFF] * (255 - n))
     assert len(preamble) == PREAMBLE
 
     buf = bytearray()
     buf += preamble
     for frame in frames_rgb565:
-        assert len(frame) == PIXEL_BYTES, f"Frame must be {PIXEL_BYTES} bytes"
+        if len(frame) != PIXEL_BYTES:
+            raise ValueError(f"Frame must be {PIXEL_BYTES} bytes, got {len(frame)}")
         buf += frame
     buf += bytes([0xFF] * tail_len)
 
@@ -279,39 +316,45 @@ def solid_rgb565(r: int, g: int, b: int) -> bytes:
 
 def extract_gif_frames(path: str, fit: bool, delay_override: int | None):
     """
-    Extract frames from a GIF, return (frames_rgb565, delays_cs).
+    Extract frames from a GIF, return (frames_rgb565, delays_ticks).
 
-    Capped at 254 frames — the device's hard limit.  A notice is printed if
-    frames are truncated so the caller is aware.
+    Capped at MAX_FRAMES (191 = 0xC0 - 1) — the firmware copies only 192 preamble
+    bytes from SPI 0x750000 into RAM 0x200021DA..0x20002299.
 
-    delays_cs: per-frame delay in wire ticks (WIRE_TICK_MS each - see that
-    constant's docstring for why this is 20ms, not the 10ms a GIF
-    centisecond would suggest). Pillow exposes duration in milliseconds via
-    img.info['duration'].
+    delay_override: optional override in milliseconds (clamped to 32-510 ms).
+    delays_ticks: per-frame delay in 2 ms wire ticks (clamped to 0x10-0xFF).
+    Pillow exposes frame duration in milliseconds via img.info['duration'].
     """
     from PIL import Image, ImageSequence
-    gif = Image.open(path)
     frames_rgb565 = []
-    delays_cs = []
+    delays_ticks = []
 
-    for frame in ImageSequence.Iterator(gif):
-        # Check the limit before converting: avoids wasted pixel work on
-        # frame 255+ and prevents the AssertionError in build_buffer().
-        if len(frames_rgb565) >= 254:
-            print("  ! reached the 254-frame device limit, truncating")
-            break
+    if delay_override is not None and not (MIN_DELAY_MS <= delay_override <= MAX_DELAY_MS):
+        print(
+            f"  ! --delay {delay_override} ms out of firmware range; "
+            f"clamping to {MIN_DELAY_MS}–{MAX_DELAY_MS} ms "
+            f"(0x{MIN_WIRE_DELAY:02X}–0x{MAX_WIRE_DELAY:02X} ticks)."
+        )
 
-        rgb565 = pil_to_rgb565(frame, fit=fit)
-        frames_rgb565.append(rgb565)
+    with Image.open(path) as gif:
+        for frame in ImageSequence.Iterator(gif):
+            # Check the limit before converting: avoids wasted pixel work on
+            # frame 192+ and prevents exceeding MAX_FRAMES.
+            if len(frames_rgb565) >= MAX_FRAMES:
+                print(f"  ! reached the {MAX_FRAMES}-frame device limit, truncating")
+                break
 
-        if delay_override is not None:
-            delay_cs = delay_override
-        else:
-            dur_ms = frame.info.get('duration', 100)
-            delay_cs = max(1, min(255, round(dur_ms / WIRE_TICK_MS)))
-        delays_cs.append(delay_cs)
+            rgb565 = pil_to_rgb565(frame, fit=fit)
+            frames_rgb565.append(rgb565)
 
-    return frames_rgb565, delays_cs
+            if delay_override is not None:
+                delay_ticks = ms_to_wire_delay(delay_override)
+            else:
+                dur_ms = frame.info.get('duration', 100)
+                delay_ticks = ms_to_wire_delay(dur_ms)
+            delays_ticks.append(delay_ticks)
+
+    return frames_rgb565, delays_ticks
 
 
 VIDEO_EXTENSIONS = {'.mp4', '.mov', '.webm', '.mkv', '.avi', '.m4v'}
@@ -328,8 +371,9 @@ def extract_video_frames(path: str, fit: bool, delay_override: int | None,
 
     fps_override: if given, frames are decimated to approximate this rate
     instead of using every decoded frame (videos are usually 24-60fps, which
-    is far more frames than useful on a 254-frame-max, single-color-depth
+    is far more frames than useful on a 191-frame-max, single-color-depth
     LCD upload - a lower fps keeps the transfer size/time sane).
+    delay_override: optional override in milliseconds (clamped to 32-510 ms).
     """
     try:
         import imageio.v3 as iio
@@ -347,29 +391,38 @@ def extract_video_frames(path: str, fit: bool, delay_override: int | None,
     step = max(1, round(src_fps / target_fps))
 
     if delay_override is not None:
-        delay_cs = delay_override
+        if not (MIN_DELAY_MS <= delay_override <= MAX_DELAY_MS):
+            print(
+                f"  ! --delay {delay_override} ms out of firmware range; "
+                f"clamping to {MIN_DELAY_MS}–{MAX_DELAY_MS} ms "
+                f"(0x{MIN_WIRE_DELAY:02X}–0x{MAX_WIRE_DELAY:02X} ticks)."
+            )
+        delay_ticks = ms_to_wire_delay(delay_override)
     else:
         effective_fps = src_fps / step
         ms_per_frame = 1000.0 / effective_fps
-        delay_cs = max(1, min(255, round(ms_per_frame / WIRE_TICK_MS)))
+        delay_ticks = ms_to_wire_delay(ms_per_frame)
+
+    if max_frames is not None and max_frames > MAX_FRAMES:
+        print(f"  ! --max-frames {max_frames} exceeds device limit; capping at {MAX_FRAMES}")
+    effective_max = min(max_frames, MAX_FRAMES) if max_frames is not None else MAX_FRAMES
 
     frames_rgb565 = []
-    delays_cs = []
+    delays_ticks = []
     for i, frame in enumerate(iio.imiter(path, plugin="FFMPEG")):
         if i % step != 0:
             continue
+        if len(frames_rgb565) >= effective_max:
+            if max_frames is None:
+                print(f"  ! reached the {MAX_FRAMES}-frame device limit, truncating")
+            break
         img = Image.fromarray(frame)
         frames_rgb565.append(pil_to_rgb565(img, fit=fit))
-        delays_cs.append(delay_cs)
-        if max_frames and len(frames_rgb565) >= max_frames:
-            break
-        if len(frames_rgb565) >= 254:
-            print("  ! reached the 254-frame device limit, truncating")
-            break
+        delays_ticks.append(delay_ticks)
 
     if not frames_rgb565:
         sys.exit(f"No frames could be decoded from {path}")
-    return frames_rgb565, delays_cs
+    return frames_rgb565, delays_ticks
 
 
 # ── USB I/O (pyusb only - see note at top of file re: hidapi) ────────────────
@@ -601,16 +654,17 @@ def main():
                      help=f'Solid colour: {", ".join(NAMED_COLORS)}')
 
     parser.add_argument('--fit', action='store_true',
-                        help='Letterbox/pillarbox to 240×135 instead of stretching')
-    parser.add_argument('--delay', type=int, metavar='CS',
-                        help='Override per-frame delay in centiseconds (GIF/video, 1–255). '
-                             'Default: read from GIF header, or derived from --fps for video.')
+                        help='Letterbox/pillarbox to 135×240 instead of stretching')
+    parser.add_argument('--delay', type=int, metavar='MS',
+                        help=f'Override per-frame delay in milliseconds ({MIN_DELAY_MS}–{MAX_DELAY_MS} ms; '
+                             f'encoded as {WIRE_TICK_MS} ms ticks 0x{MIN_WIRE_DELAY:02X}–0x{MAX_WIRE_DELAY:02X}, '
+                             f'clamped if out of range). Default: read from GIF header or derived from --fps.')
     parser.add_argument('--fps', type=float, metavar='N',
-                        help='Video only: decimate frames to approximately this rate '
-                             '(default: the video\'s native fps - usually far more frames '
-                             'than useful on a 254-frame-max upload, consider e.g. --fps 10)')
+                        help=f'Video only: decimate frames to approximately this rate '
+                             f'(default: the video\'s native fps - usually far more frames '
+                             f'than useful on a {MAX_FRAMES}-frame-max upload, consider e.g. --fps 10)')
     parser.add_argument('--max-frames', type=int, default=None,
-                        help='Limit number of frames to upload (default: all, capped at 254)')
+                        help=f'Limit number of frames to upload (default: all, capped at {MAX_FRAMES})')
     parser.add_argument('--dry-run', action='store_true',
                         help='Build the buffer and print diagnostics, do NOT touch USB')
     args = parser.parse_args()
@@ -637,8 +691,9 @@ def main():
             fps_override=args.fps, max_frames=args.max_frames,
         )
         n = len(frames)
+        ms_preview = [d * WIRE_TICK_MS for d in delays[:8]]
         print(f"Video: {n} frame{'s' if n != 1 else ''}  "
-              f"delays: {delays[:8]}{'…' if n > 8 else ''} cs")
+              f"delays: {delays[:8]}{'…' if n > 8 else ''} ticks ({ms_preview} ms)")
 
     else:
         img = Image.open(args.image)
@@ -648,11 +703,15 @@ def main():
             frames, delays = extract_gif_frames(args.image, fit=args.fit,
                                                 delay_override=args.delay)
             if args.max_frames:
-                frames  = frames[:args.max_frames]
-                delays  = delays[:args.max_frames]
+                if args.max_frames > MAX_FRAMES:
+                    print(f"  ! --max-frames {args.max_frames} exceeds device limit; capping at {MAX_FRAMES}")
+                cap = min(args.max_frames, MAX_FRAMES)
+                frames  = frames[:cap]
+                delays  = delays[:cap]
             n = len(frames)
+            ms_preview = [d * WIRE_TICK_MS for d in delays[:8]]
             print(f"GIF: {img.size}  {n} frame{'s' if n!=1 else ''}  "
-                  f"delays: {delays[:8]}{'…' if n>8 else ''} cs")
+                  f"delays: {delays[:8]}{'…' if n>8 else ''} ticks ({ms_preview} ms)")
         else:
             # Still image
             print(f"Image: {img.size} {img.mode}  →  {SCREEN_W}×{SCREEN_H} (portrait)")
@@ -665,10 +724,11 @@ def main():
         buf = build_buffer(frames, delays)
         n_chunks = total_chunks_needed(n)
         tail_len = n_chunks * CHUNK_SIZE - PREAMBLE - n * PIXEL_BYTES
-        print(f"\nDry-run: {n} frame(s)")
+        print(f"\nDry-run: {n} frame(s) (max {MAX_FRAMES})")
         print(f"  Buffer : {len(buf)} bytes  ({n_chunks} × {CHUNK_SIZE})")
         print(f"  Preamble: {buf[:4].hex()}…  "
-              f"[frame_count={buf[0]} delays={list(buf[1:1+n])}]")
+              f"[frame_count={buf[0]} delays={list(buf[1:1+n])} "
+              f"({[d * WIRE_TICK_MS for d in buf[1:1+n]]} ms @ {WIRE_TICK_MS}ms/tick)]")
         print(f"  Frame 0 pixel[0]: {buf[PREAMBLE:PREAMBLE+2].hex()}")
         if n > 1:
             f1_start = PREAMBLE + PIXEL_BYTES

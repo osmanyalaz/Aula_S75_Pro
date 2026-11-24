@@ -4,6 +4,11 @@ Command-line interface for aula_s75pro.py
 
 Examples:
     python cli.py info
+    python cli.py battery
+    python cli.py read lighting
+    python cli.py read settings
+    python cli.py read live-rgb
+    python cli.py underglow flowing
     python cli.py raw-send 04 18 00 00 ...            # send an arbitrary 64-byte report
     python cli.py raw-get
     python cli.py set-key-response 3 --sleep 2 --fn 0
@@ -12,16 +17,110 @@ Examples:
 """
 import argparse
 import sys
-from pathlib import Path
 
-from aula_s75pro import AulaS75Pro, load_keymap, REPORT_LEN, EFFECTS, DIRECTIONS, KEYMAP
+from aula_s75pro import (
+    AulaS75Pro,
+    KEYMAP,
+    PHYSICAL_INDICES,
+    REPORT_LEN,
+    UNDERGLOW_MODES,
+)
 
-HERE = Path(__file__).parent
 
 
 def cmd_info(args):
     with AulaS75Pro(mode=args.mode) as kb:
         print(f"Connected: VID={kb.vid:04X} PID={kb.pid:04X} interface={kb.interface}")
+        info = kb.read_device_info()
+    print(
+        f"Device Info (0x0504): tag={info['tag']:#06x} VID={info['vid']:04X} "
+        f"PID={info['pid']:04X} FW=v{info['fw_version']} (checksum={info['checksum']:#010x})"
+    )
+    if args.raw:
+        print(f"Raw (0x8F80): {info['raw'].hex()}")
+
+
+def cmd_battery(args):
+    with AulaS75Pro(mode=args.mode) as kb:
+        batt = kb.read_battery_level()
+    print(f"Battery (0xF604): {batt['level']}/5 ({batt['percent_range']})")
+    if args.raw:
+        print(f"Raw: {batt['raw'].hex()}")
+
+
+def cmd_read(args):
+    key_names = {idx: name for name, idx in KEYMAP.items()}
+    with AulaS75Pro(mode=args.mode) as kb:
+        if args.target == "lighting":
+            cfg = kb.read_lighting_config()
+            if cfg["erased"]:
+                print("Lighting Config (0x1204 / 0x9800): ERASED (all 0xFF)")
+            elif cfg["zeroed"]:
+                print("Lighting Config (0x1204 / 0x9800): ZEROED (all 0x00)")
+            else:
+                print(
+                    f"Lighting Config (0x1204 / 0x9800): effect={cfg['effect']:#04x}, "
+                    f"RGB={cfg['rgb']}, option={cfg['option']:#04x}, "
+                    f"brightness={cfg['brightness']}, speed={cfg['speed']}, "
+                    f"direction={cfg['direction']}, trailer={cfg['trailer'].hex()}"
+                )
+            print(f"Checksum: {cfg['checksum']:#010x}")
+            if args.raw:
+                print(f"Raw: {cfg['raw'].hex()}")
+
+        elif args.target == "settings":
+            st = kb.read_general_settings()
+            if st["erased"]:
+                print("General Settings (0x1604 / 0x9000): ERASED (all 0xFF)")
+            elif st["zeroed"]:
+                print("General Settings (0x1604 / 0x9000): ZEROED (all 0x00)")
+            else:
+                print(
+                    f"General Settings (0x1604 / 0x9000):\n"
+                    f"  disable_alt_tab={st['disable_alt_tab']}, disable_alt_f4={st['disable_alt_f4']}, "
+                    f"win_lock={st['win_lock']}\n"
+                    f"  fn_switch={st['fn_switch']}, sleep_time={st['sleep_time']} ({st['sleep_label']}), "
+                    f"key_response_time={st['key_response_time']} ({st['debounce_scans']} scans)"
+                )
+            print(f"Checksum: {st['checksum']:#010x}")
+            if args.raw:
+                print(f"Raw: {st['raw'].hex()}")
+
+        elif args.target in ("live-rgb", "custom-table"):
+            if args.target == "live-rgb":
+                data = kb.read_live_rgb()
+                title = "Live RGB RAM (0xF504)"
+            else:
+                data = kb.read_custom_lighting_table()
+                title = "Saved Custom RGB Table (0x2204 / 0x9C00)"
+            slots = sorted(data["keys"]) if args.all else sorted(
+                s for s in data["keys"] if s in PHYSICAL_INDICES and data["keys"][s] != (0, 0, 0)
+            )
+            print(f"{title}: {len(data['keys'])} slot(s) decoded, showing {len(slots)} entry/entries")
+            for s in slots:
+                r, g, b = data["keys"][s]
+                label = key_names.get(s, f"slot_{s}")
+                print(f"  {s:>3} ({label:<9}): RGB({r:3d}, {g:3d}, {b:3d})")
+            if "trailer" in data:
+                print(f"Trailer: {data['trailer'].hex()}")
+            print(f"Checksum: {data['checksum']:#010x}")
+            if args.raw:
+                print(f"Raw ({len(data['raw'])}B): {data['raw'].hex()}")
+
+
+def cmd_underglow(args):
+    preserve = not args.no_preserve
+    with AulaS75Pro(mode=args.mode) as kb:
+        res = kb.set_underglow_mode(args.underglow_mode, preserve_lighting=preserve)
+    status = "MATCH" if res["checksum_matched"] else "MISMATCH (warning issued)"
+    print(
+        f"Underglow mode {res['mode']} ({res['mode_name']}) applied; "
+        f"commit checksum={res['checksum']:#010x} ({status})"
+    )
+    if res["restored_lighting"]:
+        print("Main-key lighting flash 0x9800: restored")
+    else:
+        print("Main-key lighting flash 0x9800: not restored (empty or --no-preserve)")
 
 
 def cmd_scan(args):
@@ -68,21 +167,34 @@ def cmd_raw_get(args):
 
 def cmd_set_key_response(args):
     with AulaS75Pro(mode=args.mode) as kb:
-        resp = kb.set_key_response_time(args.value, sleep_time=args.sleep, fn_switch=args.fn)
+        resp = kb.set_key_response_time(
+            args.value,
+            sleep_time=args.sleep,
+            fn_switch=args.fn,
+            disable_alt_tab=args.disable_alt_tab,
+            disable_alt_f4=args.disable_alt_f4,
+            win_lock=args.win_lock,
+        )
     print("Device ack:", resp.hex())
 
 
 def cmd_set_sleep_time(args):
     with AulaS75Pro(mode=args.mode) as kb:
-        resp = kb.set_sleep_time(args.value, key_response_time=args.keyresponse, fn_switch=args.fn)
+        resp = kb.set_sleep_time(
+            args.value,
+            key_response_time=args.keyresponse,
+            fn_switch=args.fn,
+            disable_alt_tab=args.disable_alt_tab,
+            disable_alt_f4=args.disable_alt_f4,
+            win_lock=args.win_lock,
+        )
     print("Device ack:", resp.hex())
 
 
 def cmd_list_keys(args):
-    xml_path = args.xml or (HERE / "rgb-keyboard.xml")
-    keymap = load_keymap(str(xml_path))
-    for name, info in sorted(keymap.items(), key=lambda kv: kv[1].light_index):
-        print(f"{info.light_index:>3}  {name:<12} code={info.code:#04x} row={info.row} col={info.col}")
+    for name, idx in sorted(KEYMAP.items(), key=lambda kv: kv[1]):
+        print(f"{idx:>3}  {name}")
+
 
 def cmd_set_color(args):
     with AulaS75Pro(mode=args.mode) as kb:
@@ -145,7 +257,37 @@ def main():
                     help="connection mode (default: usb)")
     sub = p.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("info", help="connect and print device info").set_defaults(func=cmd_info)
+    sp_info = sub.add_parser("info", help="connect and query 0x0504 device/firmware info")
+    sp_info.add_argument("--raw", action="store_true", help="print raw 64-byte 0x8F80 info block")
+    sp_info.set_defaults(func=cmd_info)
+
+    sp_batt = sub.add_parser("battery", help="query 0xF604 battery level (0-5)")
+    sp_batt.add_argument("--raw", action="store_true", help="print raw 64-byte response")
+    sp_batt.set_defaults(func=cmd_battery)
+
+    sp_read = sub.add_parser("read", help="read back lighting, settings, live RGB RAM, or custom table")
+    sp_read.add_argument(
+        "target",
+        choices=["lighting", "settings", "live-rgb", "custom-table"],
+        help="page/table to read (0x1204, 0x1604, 0xF504, 0x2204)",
+    )
+    sp_read.add_argument("--raw", action="store_true", help="print raw hex bytes")
+    sp_read.add_argument("--all", action="store_true", help="for RGB tables, include black/non-physical slots")
+    sp_read.set_defaults(func=cmd_read)
+
+    sp_ug = sub.add_parser("underglow", help="set Row-6 side/underglow lighting mode (0x1304 0x20-0x24)")
+    sp_ug.add_argument(
+        "underglow_mode",
+        metavar="MODE",
+        choices=list(UNDERGLOW_MODES.keys()) + ["0", "1", "2", "3", "4"],
+        help="flowing (0), spectrum (1), static (2), breathing (3), off (4)",
+    )
+    sp_ug.add_argument(
+        "--no-preserve",
+        action="store_true",
+        help="skip saving and restoring flash page 0x9800 main-key lighting",
+    )
+    sp_ug.set_defaults(func=cmd_underglow)
 
     sub.add_parser("scan", help="list all HID devices hidapi can see (debugging)").set_defaults(func=cmd_scan)
 
@@ -159,17 +301,23 @@ def main():
     sp.add_argument("value", type=int, help="raw value to send (see PROTOCOL.md)")
     sp.add_argument("--sleep", type=int, default=0, help="current sleep_time value to preserve")
     sp.add_argument("--fn", type=int, default=0, help="current fn_switch value to preserve")
+    sp.add_argument("--disable-alt-tab", action="store_true", help="disable Alt+Tab")
+    sp.add_argument("--disable-alt-f4", action="store_true", help="disable Alt+F4")
+    sp.add_argument("--win-lock", action="store_true", help="enable Win-Lock")
     sp.set_defaults(func=cmd_set_key_response)
 
     sp = sub.add_parser("set-sleep-time", help="set the sleep timer")
     sp.add_argument("value", type=int, help="raw value to send (see PROTOCOL.md)")
     sp.add_argument("--keyresponse", type=int, default=0, help="current key_response_time value to preserve")
     sp.add_argument("--fn", type=int, default=0, help="current fn_switch value to preserve")
+    sp.add_argument("--disable-alt-tab", action="store_true", help="disable Alt+Tab")
+    sp.add_argument("--disable-alt-f4", action="store_true", help="disable Alt+F4")
+    sp.add_argument("--win-lock", action="store_true", help="enable Win-Lock")
     sp.set_defaults(func=cmd_set_sleep_time)
 
     sp = sub.add_parser("list-keys", help="list the keyboard's key/light index map")
-    sp.add_argument("--xml", help="path to rgb-keyboard.xml (defaults to the bundled copy)")
     sp.set_defaults(func=cmd_list_keys)
+
 
     parser_color = sub.add_parser('color', help='Set global lighting effect')
     parser_color.add_argument('r', type=int, help='Red (0-255)')

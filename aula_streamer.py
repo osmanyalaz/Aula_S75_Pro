@@ -65,16 +65,22 @@ class AulaStreamer:
         # ([report ID 0] + 64-byte payload). Zero-fill = black padding.
         self.buffer = bytearray(65 * self.CHUNKS)
 
-        keys = list(keymap.values())[: self.MAX_KEYS]
+        # Support both a {name: KeyInfo} dict (load_keymap output, which has a
+        # .light_index attribute) and a plain {name: int} dict (keymap.KEYMAP).
+        def _light_index(k):
+            return k.light_index if hasattr(k, "light_index") else int(k)
 
-        max_idx = max((k.light_index for k in keys), default=0)
+        keys = [_light_index(k) for k in list(keymap.values())[: self.MAX_KEYS]]
+
+        max_idx = max(keys, default=0)
         self._offsets = [0] * (max_idx + 1)
-        for i, key in enumerate(keys):
+        for i, light_idx in enumerate(keys):
             chunk_idx = i // self.KEYS_PER_CHUNK
             key_in_chunk = i % self.KEYS_PER_CHUNK
             offset = (chunk_idx * 65) + 1 + (key_in_chunk * 4)
-            self.buffer[offset] = key.light_index
-            self._offsets[key.light_index] = offset
+            self.buffer[offset] = light_idx
+            self._offsets[light_idx] = offset
+
 
     def set_color(self, light_index, r, g, b):
         """Set one key's colour. Out-of-range/negative indices ignored."""
