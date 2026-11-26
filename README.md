@@ -27,15 +27,21 @@ lighting effects, per-key RGB streaming (RAM-only, ~28 fps wired; 15×6 music EQ
     python test.py                               # WASD blink (wired streaming demo)
 
 ## Linux `udev` rules (non-root access)
-Create `/etc/udev/rules.d/99-aula-s75pro.rules`:
+Create `/etc/udev/rules.d/70-aula-s75pro.rules` (must be numbered below `73` so `TAG+="uaccess"` runs before systemd's `73-seat-late.rules`):
 
-    # Wired USB (0c45:800a)
-    SUBSYSTEM=="usb", ATTR{idVendor}=="0c45", ATTR{idProduct}=="800a", MODE="0666"
-    SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0c45", ATTRS{idProduct}=="800a", MODE="0666"
+    # AULA S75 Pro - Wired USB (HID config + PyUSB TFT screen upload)
+    SUBSYSTEM=="usb", ATTR{idVendor}=="0c45", ATTR{idProduct}=="800a", TAG+="uaccess"
+    SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0c45", ATTRS{idProduct}=="800a", TAG+="uaccess"
 
-    # 2.4GHz Wireless Dongle (05ac:024f "2.4G Dongle")
-    SUBSYSTEM=="usb", ATTR{idVendor}=="05ac", ATTR{idProduct}=="024f", ATTR{product}=="2.4G Dongle", MODE="0666"
-    SUBSYSTEM=="hidraw", ATTRS{idVendor}=="05ac", ATTRS{idProduct}=="024f", ATTRS{product}=="2.4G Dongle", MODE="0666"
+    # AULA S75 Pro - 2.4GHz Dongle (scoped by product string)
+    SUBSYSTEM=="usb", ATTR{idVendor}=="05ac", ATTR{idProduct}=="024f", ATTR{product}=="2.4G Dongle", TAG+="uaccess"
+    SUBSYSTEM=="hidraw", ATTRS{idVendor}=="05ac", ATTRS{idProduct}=="024f", ATTRS{product}=="2.4G Dongle", TAG+="uaccess"
+
+    # AULA S75 Pro - 2.4GHz Dongle (fallback VID:PID from config.xml)
+    SUBSYSTEM=="usb", ATTR{idVendor}=="0c45", ATTR{idProduct}=="fefe", TAG+="uaccess"
+    SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0c45", ATTRS{idProduct}=="fefe", TAG+="uaccess"
+
+> **Non-systemd / headless systems:** `TAG+="uaccess"` relies on `systemd-logind` to grant ACL access to the active local seat. On systems without `systemd`/`logind` (or for headless/SSH access without a local seat), replace `TAG+="uaccess"` with `MODE="0666"`.
 
 Reload rules:
 
