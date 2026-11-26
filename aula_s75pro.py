@@ -46,25 +46,30 @@ except ImportError as e:  # pragma: no cover
 
 
 # --------------------------------------------------------------------------------------
-# Device identification (from config.xml)
+# Device identification (lsusb, DeviceDriver.exe, and config.xml)
 # --------------------------------------------------------------------------------------
 VID = 0x0C45
 
-PID_USB = 0x800A       # mode value="0" desc="USB"       hid_interface="VID_0C45&PID_800A&MI_00"
-PID_DONGLE = 0xFEFE    # mode value="2" desc="2.4G TYPE-A" hid_interface="VID_0C45&PID_FEFE&MI_03"
-
-# Vendor HID interface for feature reports.
-# NOTE: config.xml labels the USB mode as "MI_00" — that is the Windows HID path
-# suffix for the *Boot Keyboard* interface, not the vendor control interface.
-# USB captures (PROTOCOL.md §1) and all captures confirm that 64-byte feature
-# reports are sent/received on **interface 3** in both wired and dongle modes.
+PID_USB = 0x800A       # wired USB (SONiX AULA-S75Pro)
 INTERFACE_USB = 3
+
+# Real 2.4GHz wireless dongle (confirmed by lsusb & DeviceDriver.exe):
+# VID=0x05AC PID=0x024F, product_string="2.4G Dongle", Interface 3 (32 B Interrupt).
+# Interface 4 on 05AC:024F is a separate 64 B vendor interface and must not be matched.
+VID_DONGLE = 0x05AC
+PID_DONGLE = 0x024F
+DONGLE_PRODUCT_NAME = "2.4G Dongle"
+VID_DONGLE_FALLBACK = 0x0C45
+PID_DONGLE_FALLBACK = 0xFEFE    # config.xml placeholder fallback
 INTERFACE_DONGLE = 3
 
 REPORT_ID = 0x00
-REPORT_LEN = 64  # payload length (wLength = 0x40), NOT counting the HID report-id byte
+REPORT_LEN = 64        # wired EP0 Feature payload length (wLength = 0x40), excluding report-id
+DONGLE_PACKET_LEN = 33 # 2.4G Interrupt OUT/IN transfer length: 1 B report-id (0x00) + 32 B frame
+DONGLE_PAYLOAD_LEN = 28
+DONGLE_SETTINGS_LEN = 0x10
 
-# Command words (little-endian on the wire: byte0=lo, byte1=hi)
+# Wired USB command words (little-endian on the wire: byte0=lo, byte1=hi)
 CMD_COMMIT = 0x0204             # commit / read 32-bit LE checksum in resp[4..7]
 CMD_DEVICE_INFO = 0x0504        # read device info block from flash 0x00008F80 (max 2 chunks)
 CMD_LIGHTING_READ = 0x1204      # read lighting config page from flash 0x00009800 (max 1 chunk)
@@ -82,13 +87,22 @@ CMD_LIGHT_READ = 0xF504         # wire 04 F5: read live RGB RAM (0x20001838/195E
 CMD_BATTERY_LEVEL = 0xF604      # wire 04 F6: read quantized battery level (0-5) in resp[4]
 CMD_STREAM_FRAME = 0x2004       # frame update for dynamic RGB music mode (ISR fast-path)
 
+# 2.4GHz Dongle Interrupt command IDs (FUN_00005990 / FUN_0044f980)
+DONGLE_CMD_INFO = 0x02          # len=0x00 -> echoes 28 B device info block from flash 0x00008F80
+DONGLE_CMD_LIGHTING = 0x05      # len=0x10 -> 16 B global lighting OR Row-6 underglow (0x20-0x24)
+DONGLE_CMD_SETTINGS = 0x07      # len=0x10 -> 16 B general settings
+DONGLE_CMD_MUSIC_EQ = 0x0B      # len=0x1C -> 15-col x 6-row wireless music EQ frame
+DONGLE_CMD_RTC = 0x0C           # len=0x10 -> 16 B RTC sync
+DONGLE_CMD_CUSTOM_RGB = 0x14    # 21 chunks (seq 0..19 len=0x1C, seq 20 len=0x10) after 0x05 0x80
+DONGLE_CMD_BATTERY = 0x20       # len=0x01 -> echoes exact battery % (0-100) in reply[3]
+
 TRAILER = b"\xAA\x55"     # observed at the very end of the 64-byte buffer on writes
 
 # Custom lighting table dimensions (verified against escToRed.pcapng, PROTOCOL.md §5)
 TABLE_SIZE   = 576  # 144 slots × 4 bytes each (light_index, R, G, B)
 TABLE_CHUNKS = 9    # 576 / 64 bytes-per-report
 
-# Row-6 side / underglow modes (0x1304 with payload[0] = 0x20 + mode_id)
+# Row-6 side / underglow modes (0x1304 or 2.4G 0x05 with payload[0] = 0x20 + mode_id)
 UNDERGLOW_MODES = {
     "flowing": 0,
     "spectrum": 1,
@@ -117,6 +131,10 @@ class McuRejectedError(RuntimeError):
     """Raised immediately when the MCU responds with explicit error status 0xFF."""
 
 
+class UnsupportedModeError(NotImplementedError):
+    """Raised when an operation is only supported in wired USB or 2.4G dongle mode."""
+
+
 def _le16(cmd: int) -> bytes:
     """Encode a command word as little-endian bytes (byte0=lo, byte1=hi)."""
     return bytes([cmd & 0xFF, (cmd >> 8) & 0xFF])
@@ -137,6 +155,74 @@ def build_report(cmd: int, body: bytes = b"", trailer: bool = False, size: int =
     if trailer:
         buf[-2:] = TRAILER
     return buf
+
+
+def build_dongle_packet(cmd: int, length: int, seq: int = 0, payload: bytes = b"") -> bytes:
+    """Build a 33-byte 2.4G Interrupt OUT report: [0x00, cmd, len, seq, payload[0..27], sum(0..31)&0xFF]."""
+    if not (0 <= cmd <= 0xFF):
+        raise ValueError(f"2.4G cmd must be 0..255, got {cmd}")
+    if not (0 <= length <= DONGLE_PAYLOAD_LEN):
+        raise ValueError(f"2.4G length must be 0..{DONGLE_PAYLOAD_LEN}, got {length}")
+    if not (0 <= seq <= 0xFF):
+        raise ValueError(f"2.4G seq must be 0..255, got {seq}")
+    if len(payload) > DONGLE_PAYLOAD_LEN:
+        raise ValueError(f"2.4G payload max {DONGLE_PAYLOAD_LEN} bytes, got {len(payload)}")
+    pkt = bytearray(DONGLE_PACKET_LEN)
+    pkt[0] = REPORT_ID
+    pkt[1] = cmd
+    pkt[2] = length
+    pkt[3] = seq
+    pkt[4:4 + len(payload)] = payload
+    pkt[32] = sum(pkt[:32]) & 0xFF
+    return bytes(pkt)
+
+
+def parse_dongle_reply(raw) -> bytes:
+    """Normalize a 2.4G Interrupt IN read (32 B hidraw or 33 B Report-ID-0 prefixed) to 32 B."""
+    if not raw:
+        return b""
+    data = bytes(raw)
+    if len(data) == DONGLE_PACKET_LEN and data[0] == REPORT_ID:
+        return data[1:33]
+    return data[:32]
+
+
+def battery_percent_to_level(percent: int) -> int:
+    """Convert exact percentage (0-100) to firmware's 0-5 quantized tier (FUN_00004d8c)."""
+    if percent < 6:
+        return 0
+    if percent < 26:
+        return 1
+    if percent < 51:
+        return 2
+    if percent < 76:
+        return 3
+    if percent < 96:
+        return 4
+    return 5
+
+
+def _parse_underglow_mode(mode: int | str) -> int:
+    if isinstance(mode, bool):
+        raise ValueError(f"Invalid underglow mode: {mode!r}")
+    if isinstance(mode, str):
+        key = mode.strip().lower()
+        if key in UNDERGLOW_MODES:
+            mode_id = UNDERGLOW_MODES[key]
+        elif key.isdigit():
+            mode_id = int(key)
+        else:
+            raise ValueError(
+                f"Unknown underglow mode {mode!r}; "
+                f"expected {', '.join(UNDERGLOW_MODES)} or 0-4."
+            )
+    elif isinstance(mode, int):
+        mode_id = mode
+    else:
+        raise ValueError(f"Invalid underglow mode type: {type(mode).__name__}")
+    if not (0 <= mode_id <= 4):
+        raise ValueError(f"Underglow mode must be 0-4, got {mode_id}")
+    return mode_id
 
 
 # --------------------------------------------------------------------------------------
@@ -176,68 +262,140 @@ def load_keymap(xml_path: str) -> dict:
 # Main controller
 # --------------------------------------------------------------------------------------
 class AulaS75Pro:
-    def __init__(self, mode: str = "usb", vid: int = VID, path: Optional[bytes] = None):
+    def __init__(self, mode: str = "usb", vid: Optional[int] = None, path: Optional[bytes] = None):
         """
-        mode: 'usb' (wired, PID 0x800A, interface 3) or 'dongle' (2.4G, PID 0xFEFE, interface 3)
-        path: if you already know the exact hidapi device path, pass it directly and
-              `mode`/`vid` are ignored for opening.
+        mode: 'auto' (wired USB preferred, 2.4G dongle fallback),
+              'usb' (wired, 0x0C45:0x800A interface 3), or
+              'dongle' (2.4G, 0x05AC:0x024F '2.4G Dongle' interface 3; 0x0C45:0xFEFE fallback).
+        path: if you already know the exact hidapi device path, pass it directly.
         """
+        if mode not in ("auto", "usb", "dongle"):
+            raise ValueError("mode must be 'auto', 'usb', or 'dongle'")
         self.mode = mode
-        self.vid = vid
-        if mode == "usb":
-            self.pid, self.interface = PID_USB, INTERFACE_USB
-        elif mode == "dongle":
-            self.pid, self.interface = PID_DONGLE, INTERFACE_DONGLE
+        self._explicit_vid = vid
+        self._transport = "dongle" if mode == "dongle" else "usb"
+        if mode == "dongle":
+            self.vid = VID_DONGLE if vid is None else vid
+            self.pid = PID_DONGLE
+            self.interface = INTERFACE_DONGLE
         else:
-            raise ValueError("mode must be 'usb' or 'dongle'")
+            self.vid = VID if vid is None else vid
+            self.pid = PID_USB
+            self.interface = INTERFACE_USB
         self._path = path
         self.dev: Optional["hid.device"] = None
 
-    # ---- connection -------------------------------------------------------
-    # def find_path(self) -> bytes:
-    #     candidates = [
-    #         d for d in hid.enumerate(self.vid, self.pid)
-    #         if d.get("interface_number") == self.interface
-    #     ]
-    #     if not candidates:
-    #         # fall back to any interface on that VID/PID, in case the OS numbers differently
-    #         candidates = [d for d in hid.enumerate(self.vid, self.pid)]
-    #     if not candidates:
-    #         raise IOError(
-    #             f"No HID device found for VID={self.vid:04X} PID={self.pid:04X}. "
-    #             "Is the keyboard connected in the right mode (usb/dongle)?"
-    #         )
-    #     return candidates[0]["path"]
+    @property
+    def active_mode(self) -> str:
+        """Resolved transport mode ('usb' or 'dongle')."""
+        return self._transport
 
-    def find_path(self) -> bytes:
-        candidates = hid.enumerate(self.vid, self.pid)
+    @property
+    def is_dongle(self) -> bool:
+        return self._transport == "dongle"
+
+    def _require_wired(self, op_name: str) -> None:
+        if self.is_dongle:
+            raise UnsupportedModeError(
+                f"{op_name} is only supported in wired USB mode (0x0C45:0x800A); "
+                "the 2.4G wireless dongle does not support 64-byte Feature flash/RAM read-back."
+            )
+
+    def _require_dongle(self, op_name: str) -> None:
+        if not self.is_dongle:
+            raise UnsupportedModeError(
+                f"{op_name} is only supported over the 2.4G wireless dongle; "
+                "use live 0x2004 streaming (AulaStreamer) in wired USB mode."
+            )
+
+    @staticmethod
+    def _find_usb_candidate(vid: int) -> Optional[tuple[int, int, bytes]]:
+        candidates = hid.enumerate(vid, PID_USB)
         if not candidates:
-            raise IOError(f"No device found with VID={self.vid:04X} PID={self.pid:04X}")
+            return None
 
-        # 1. Best: Match by Vendor-Defined Usage Page (works on Windows, macOS, hidapi-libusb)
+        # 1. Best: Match by Vendor-Defined Usage Page (Windows, macOS, hidapi-libusb)
         for d in candidates:
             if (d.get("usage_page") or 0) >= 0xFF00:
-                return d["path"]
+                return (vid, PID_USB, d["path"])
 
-        # 2. Linux hidraw: usage_page is always 0, so fall back to interface number.
-        #    Now that INTERFACE_USB == 3 this directly selects the vendor interface.
+        # 2. Linux hidraw: usage_page is always 0, so fall back to interface 3.
         for d in candidates:
-            if d.get("interface_number") == self.interface:
-                return d["path"]
+            if d.get("interface_number") == INTERFACE_USB:
+                return (vid, PID_USB, d["path"])
 
-        # 3. Active Probe Fallback: Try opening candidates and sending a benign GET_REPORT.
-        #    Only the vendor interface (interface 3) accepts a 64-byte feature report.
+        # 3. Active probe fallback (wired USB only; interface 3 accepts 64-byte feature reports)
         for d in candidates:
             try:
                 test_dev = hid.device()
                 test_dev.open_path(d["path"])
                 test_dev.get_feature_report(0, 65)
                 test_dev.close()
-                return d["path"]
+                return (vid, PID_USB, d["path"])
             except Exception:
                 continue
-        # 4. Ultimate fallback: return the first candidate and let the caller fail loudly.
-        return candidates[0]["path"]
+
+        return (vid, PID_USB, candidates[0]["path"])
+
+    @staticmethod
+    def _pick_dongle_interface3(candidates: list[dict]) -> Optional[bytes]:
+        # Explicitly require interface_number == 3: 05AC:024F exposes Interface 4
+        # as a separate 64-byte vendor interface, so matching usage_page >= 0xFF00 alone fails.
+        iface3 = [d for d in candidates if d.get("interface_number") == INTERFACE_DONGLE]
+        if not iface3:
+            return None
+        for d in iface3:
+            if (d.get("usage_page") or 0) >= 0xFF00:
+                return d["path"]
+        return iface3[0]["path"]
+
+    def _find_dongle_candidate(self) -> Optional[tuple[int, int, bytes]]:
+        if self._explicit_vid is None or self._explicit_vid == VID_DONGLE:
+            primary = [
+                d for d in hid.enumerate(VID_DONGLE, PID_DONGLE)
+                if (d.get("product_string") or "").strip() == DONGLE_PRODUCT_NAME
+            ]
+            path = self._pick_dongle_interface3(primary)
+            if path is not None:
+                return (VID_DONGLE, PID_DONGLE, path)
+
+        fb_vid = VID_DONGLE_FALLBACK if self._explicit_vid is None else self._explicit_vid
+        fb = hid.enumerate(fb_vid, PID_DONGLE_FALLBACK)
+        path = self._pick_dongle_interface3(fb)
+        if path is not None:
+            return (fb_vid, PID_DONGLE_FALLBACK, path)
+        return None
+
+    def find_path(self) -> bytes:
+        usb_vid = VID if self._explicit_vid is None else self._explicit_vid
+        if self.mode in ("usb", "auto"):
+            found = self._find_usb_candidate(usb_vid)
+            if found is not None:
+                self._transport = "usb"
+                self.vid, self.pid, path = found
+                self.interface = INTERFACE_USB
+                return path
+            if self.mode == "usb":
+                raise IOError(f"No device found with VID={usb_vid:04X} PID={PID_USB:04X}")
+
+        found = self._find_dongle_candidate()
+        if found is not None:
+            self._transport = "dongle"
+            self.vid, self.pid, path = found
+            self.interface = INTERFACE_DONGLE
+            return path
+
+        if self.mode == "auto":
+            raise IOError(
+                f"No AULA S75 Pro found in wired USB (VID={usb_vid:04X} PID={PID_USB:04X}) "
+                f"or 2.4G dongle mode (VID={VID_DONGLE:04X} PID={PID_DONGLE:04X} "
+                f"product={DONGLE_PRODUCT_NAME!r} iface={INTERFACE_DONGLE}, "
+                f"fallback {VID_DONGLE_FALLBACK:04X}:{PID_DONGLE_FALLBACK:04X})"
+            )
+        raise IOError(
+            f"No 2.4G dongle interface 3 found with VID={VID_DONGLE:04X} PID={PID_DONGLE:04X} "
+            f"product={DONGLE_PRODUCT_NAME!r} (or fallback {VID_DONGLE_FALLBACK:04X}:{PID_DONGLE_FALLBACK:04X})"
+        )
 
 
     def wait_until_idle(self):
@@ -311,10 +469,26 @@ class AulaS75Pro:
         self.dev = hid.device()
         self.dev.open_path(path)
         self.dev.set_nonblocking(False)
-        
+
+        if self.is_dongle:
+            try:
+                self.ping_dongle()
+            except (IOError, OSError) as e:
+                self.close()
+                raise IOError(
+                    f"Cannot communicate with the 2.4G dongle: {e}\n"
+                    "Check: dongle plugged in, udev rule "
+                    '(SUBSYSTEM=="hidraw", ATTRS{{idVendor}}=="05ac", ATTRS{{idProduct}}=="024f", MODE="0666"), '
+                    "and that no other process holds the device."
+                ) from e
+            except Exception:
+                self.close()
+                raise
+            return self
+
         # Check board status and abort stuck transactions before we do anything
         self.wait_until_idle()
-        
+
         return self
 
     def close(self):
@@ -330,16 +504,76 @@ class AulaS75Pro:
 
     # ---- raw transport ------------------------------------------------------
     def raw_send(self, payload: bytes):
-        """Send a raw 64-byte feature report (SET_REPORT)."""
+        """Send a raw 64-byte feature report (SET_REPORT; wired USB only)."""
+        self._require_wired("raw_send()")
         if len(payload) != REPORT_LEN:
             raise ValueError(f"payload must be exactly {REPORT_LEN} bytes, got {len(payload)}")
         data = bytes([REPORT_ID]) + bytes(payload)
         self.dev.send_feature_report(data)
 
     def raw_get(self) -> bytes:
-        """Read back a 64-byte feature report (GET_REPORT). Returns payload without report id."""
+        """Read back a 64-byte feature report (GET_REPORT; wired USB only). Returns payload without report id."""
+        self._require_wired("raw_get()")
         data = self.dev.get_feature_report(REPORT_ID, REPORT_LEN + 1)
         return bytes(data[1:1 + REPORT_LEN])
+
+    def _dongle_transact(
+        self,
+        cmd: int,
+        length: int,
+        seq: int = 0,
+        payload: bytes = b"",
+        *,
+        retries: int = 20,
+        read_timeout_ms: int = 100,
+    ) -> bytes:
+        """Send one 33-byte 2.4G Interrupt OUT frame and wait for matching Interrupt IN echo."""
+        self._require_dongle(f"2.4G command 0x{cmd:02X}")
+        if self.dev is None:
+            raise RuntimeError("Device is not open; call open() or use a 'with' block first.")
+
+        for _ in range(2):
+            try:
+                if not self.dev.read(DONGLE_PACKET_LEN, 2):
+                    break
+            except Exception:
+                break
+
+        pkt = build_dongle_packet(cmd, length, seq, payload)
+        written = self.dev.write(pkt)
+        if written <= 0:
+            time.sleep(0.01)
+            written = self.dev.write(pkt)
+            if written <= 0:
+                raise IOError(f"hid.write() failed for 2.4G cmd 0x{cmd:02X} (returned {written})")
+
+        time.sleep(0.005)
+
+        exp_cmd = cmd & 0xFF
+        exp_len = length & 0xFF
+        exp_seq = seq & 0xFF
+        last_reply = b""
+        for _ in range(retries):
+            raw = self.dev.read(DONGLE_PACKET_LEN, read_timeout_ms)
+            reply = parse_dongle_reply(raw)
+            if reply:
+                last_reply = reply
+            if (
+                len(reply) >= 3
+                and reply[0] == exp_cmd
+                and reply[1] == exp_len
+                and reply[2] == exp_seq
+            ):
+                return reply
+        raise RuntimeError(
+            f"2.4G dongle did not respond to cmd 0x{cmd:02X} "
+            f"(len=0x{length:02X}, seq={seq}); ensure the keyboard is switched to 2.4G and awake. "
+            f"Last reply: {last_reply.hex() if last_reply else 'None'}"
+        )
+
+    def ping_dongle(self) -> bytes:
+        """Probe the 2.4G wireless keyboard link via cmd 0x02 (len=0x00, seq=0x00)."""
+        return self._dongle_transact(DONGLE_CMD_INFO, 0x00, 0x00)
 
     def send_cmd(self, cmd: int, body: bytes = b"", trailer: bool = False, delay: float = 0.005):
         self.raw_send(build_report(cmd, body, trailer))
@@ -380,6 +614,25 @@ class AulaS75Pro:
             time.sleep(delay)
         raise RuntimeError(f"MCU did not ACK cmd {expected_cmd:#06x}. Last resp: {last_resp.hex() if last_resp else 'None'}")
 
+    @staticmethod
+    def _build_general_settings_body(
+        fn_switch: int = 0,
+        sleep_time: int = 0,
+        key_response_time: int = 0,
+        disable_alt_tab: bool = False,
+        disable_alt_f4: bool = False,
+        win_lock: bool = False,
+    ) -> bytes:
+        return bytes([
+            1 if disable_alt_tab else 0,
+            1 if disable_alt_f4 else 0,
+            1 if win_lock else 0,
+            fn_switch & 0xFF,
+            sleep_time & 0xFF,
+            0,  # unused gap byte, always 0 in captures
+            key_response_time & 0xFF,
+        ])
+
     # ---- verified: general settings (Alt+Tab / Alt+F4 / Win-Lock / fn switch / sleep / response) ----
     def write_general_settings(
         self,
@@ -392,9 +645,24 @@ class AulaS75Pro:
         verify: bool = True,
     ) -> bytes:
         """
-        Write general settings to flash page 0x00009000 via 0x1704 and verify the
-        32-bit little-endian commit checksum over all 64 written bytes.
+        Write general settings (wired 0x1704 to flash 0x00009000, or 2.4G 0x07 len=0x10).
         """
+        body = self._build_general_settings_body(
+            fn_switch=fn_switch,
+            sleep_time=sleep_time,
+            key_response_time=key_response_time,
+            disable_alt_tab=disable_alt_tab,
+            disable_alt_f4=disable_alt_f4,
+            win_lock=win_lock,
+        )
+        payload = bytes(build_report(CMD_GENERAL_SETTINGS, body, trailer=True))
+
+        if self.is_dongle:
+            return self._dongle_transact(
+                DONGLE_CMD_SETTINGS, DONGLE_SETTINGS_LEN, 0x00, payload[:14] + TRAILER
+            )
+
+        # Wired USB:
         # 1) open/ping
         self.send_cmd(CMD_OPEN)
         self._wait_ack(CMD_OPEN)
@@ -404,16 +672,6 @@ class AulaS75Pro:
         self._wait_ack(CMD_SETTINGS_WRITE)
 
         # 3) the actual settings write (64-byte payload)
-        body = bytes([
-            1 if disable_alt_tab else 0,
-            1 if disable_alt_f4 else 0,
-            1 if win_lock else 0,
-            fn_switch & 0xFF,
-            sleep_time & 0xFF,
-            0,  # unused gap byte, always 0 in captures
-            key_response_time & 0xFF,
-        ])
-        payload = bytes(build_report(CMD_GENERAL_SETTINGS, body, trailer=True))
         self.raw_send(payload)
         time.sleep(0.05)
 
@@ -529,7 +787,12 @@ class AulaS75Pro:
             brightness=brightness, speed=speed,
             direction=direction, option=option,
         )
-        # Double sequence required to clear MCU animation pointers.
+        if self.is_dongle:
+            self._dongle_transact(
+                DONGLE_CMD_LIGHTING, DONGLE_SETTINGS_LEN, 0x00, bytes(payload[:14]) + TRAILER
+            )
+            return
+        # Wired USB: double sequence required to clear MCU animation pointers.
         # 0.5 s gap: the first CMD_FINALIZE can trigger a flash write that
         # takes several seconds; starting the second sequence too soon causes
         # the second commit poll to hit the all-zeros flash-busy window.
@@ -540,12 +803,8 @@ class AulaS75Pro:
 
     def set_custom_lighting(self, key_colors: dict, brightness: int = 5):
         """
-        Apply a per-key custom colour table and save it to flash.
-
-        Implements the two-transaction sequence verified in escToRed.pcapng
-        and documented in PROTOCOL.md §5.  The entire sequence is executed
-        **twice** (matching the official driver) to ensure MCU animation
-        pointers and flash buffers latch cleanly.
+        Apply a per-key custom colour table and save it to flash
+        (wired 0x1304/0x2304 two-transaction flow or 2.4G 0x05 + 21x 0x14 chunks).
 
         Args:
             key_colors: {light_index (int): (r, g, b)} — keys not listed are
@@ -555,12 +814,6 @@ class AulaS75Pro:
                         trailer at slot 143.
             brightness: brightness byte passed to Transaction A's mode-select
                         write (0–5; default 5 matches the official driver).
-
-        Wire flow per iteration (PROTOCOL.md §5):
-            [Tx A] CMD_OPEN → 0x1304 probe → mode 0x80 payload → CMD_COMMIT
-                   → CMD_FINALIZE
-            [Tx B] CMD_OPEN → 0x2304 probe → 9×64-byte raw table chunks
-                   → CMD_COMMIT → GET_REPORT (checksum verify) → CMD_FINALIZE
         """
         # ---- validate --------------------------------------------------------
         # PHYSICAL_INDICES is the allowlist of safe light_index values derived
@@ -581,18 +834,7 @@ class AulaS75Pro:
                         f"key {idx}: {name}={val} is not in range 0–255."
                     )
 
-
         # ---- build the 576-byte table buffer ---------------------------------
-        # Layout: slot i occupies bytes [i*4 : i*4+4] = [light_index, R, G, B].
-        #
-        # The official driver (FUN_0044b900) writes the light_index byte into
-        # slot[0] for EVERY physical key, even those that are off (RGB = 0).
-        # Omitting these index bytes produces a checksum mismatch.  We replicate
-        # this by iterating PHYSICAL_INDICES first, then overwriting RGB for
-        # keys in key_colors.
-        #
-        # Slot 0 stays zero (reserved; byte-offsets 0–3 are never touched).
-        # Trailer AA 55 replaces the last 2 bytes of slot 143 (offsets 574–575).
         table = bytearray(TABLE_SIZE)
         for idx in PHYSICAL_INDICES:            # pass 1: stamp every physical key's index byte
             table[idx * 4] = idx
@@ -605,9 +847,20 @@ class AulaS75Pro:
         table[574] = 0xAA
         table[575] = 0x55
 
+        if self.is_dongle:
+            mode_16 = bytes(self._build_mode_payload(effect=0x80, brightness=brightness)[:14]) + TRAILER
+            self._dongle_transact(DONGLE_CMD_LIGHTING, DONGLE_SETTINGS_LEN, 0x00, mode_16)
+            time.sleep(0.05)
+            total_chunks = (len(table) + DONGLE_PAYLOAD_LEN - 1) // DONGLE_PAYLOAD_LEN
+            for seq in range(total_chunks):
+                chunk = bytes(table[seq * DONGLE_PAYLOAD_LEN : (seq + 1) * DONGLE_PAYLOAD_LEN])
+                self._dongle_transact(DONGLE_CMD_CUSTOM_RGB, len(chunk), seq, chunk)
+                if seq + 1 < total_chunks:
+                    time.sleep(0.002)
+            return
+
         # Compute full 32-bit byte-sum checksum returned in CMD_COMMIT resp[4..7].
         expected_checksum = sum(table) & 0xFFFFFFFF
-
 
         def _run_once():
             # -- Transaction A: switch board to custom-light mode (0x80) ------
@@ -657,9 +910,6 @@ class AulaS75Pro:
                 ack_valid = False
 
             # Checksum verification (resp[4..7] = 32-bit LE sum).
-            # Only checked when _wait_ack returned a real ACK: an all-zeros
-            # flash-housekeeping response carries no meaningful checksum and
-            # would produce a false "mismatch" warning against 0x00000000.
             if ack_valid:
                 if len(ack) >= 8:
                     mcu_checksum = parse_commit_checksum(ack)
@@ -674,7 +924,6 @@ class AulaS75Pro:
                         print(f"Custom table checksum OK ({mcu_checksum:#010x}).")
                 else:
                     print("warning: ACK response too short to read checksum.")
-
 
             # Finalize: ~35 ms after commit ACK (PROTOCOL.md §5 step 11)
             time.sleep(0.035)
@@ -712,31 +961,17 @@ class AulaS75Pro:
 
     def sync_rtc(self, when: Optional["datetime"] = None):
         """
-        Sync the keyboard's RTC to the PC clock.
-
-        Verified against musicRGB2.pcapng (t=10.126-10.381s). NOTE: this
-        transaction was originally misidentified as "music mode params";
-        the bytes decode as a timestamp (5a yy mm dd HH MM SS 00 04) and
-        replaying them visibly jumps the TFT clock. The driver's UI syncs
-        the keyboard clock this way. The 0x2804 probe selects the RTC page,
-        like 0x1304 selects the lighting page and 0x1704 the settings page.
-
-        The commit status byte does NOT indicate accepted/rejected: a status of 0
-        was once read as a "rejection" (replaying the capture's stale Sep-17
-        timestamp), but the TFT clock advanced anyway. The write applies
-        regardless, so this only warns instead of raising. Pass `when` for tests.
-
-        Wire sequence (either interface works; the capture used 3):
-            04 18                      open
-            04 28 00 00 00 00 01       select RTC page
-            00 01 5a <timestamp> ... aa 55
-            04 02                      commit
-        Cadence matters: ~36 ms SET->GET, ONE status GET per SET.
+        Sync the keyboard's RTC to the PC clock (wired 0x2804 or 2.4G 0x0C len=0x10).
+        Pass `when` for deterministic tests.
         """
         from datetime import datetime
         t = when or datetime.now()
         body = bytes([0x5A, t.year - 2000, t.month, t.day,
                       t.hour, t.minute, t.second, 0x00, t.isoweekday() % 7])
+
+        if self.is_dongle:
+            payload_16 = _le16(CMD_GENERAL_SETTINGS) + body + bytes(3) + TRAILER
+            return self._dongle_transact(DONGLE_CMD_RTC, DONGLE_SETTINGS_LEN, 0x00, payload_16)
 
         def step(cmd, payload=b"", trailer=False):
             self.send_cmd(cmd, payload, trailer=trailer, delay=0.0)
@@ -744,8 +979,8 @@ class AulaS75Pro:
             return self.raw_get()
 
         step(CMD_OPEN)                          # expect 04 18 00 01 ...
-        step(0x2804, bytes([0, 0, 0, 0, 0, 0, 1]))    # expect 04 28 00 01 ...
-        step(0x0100, body, trailer=True)        # expect echo of body
+        step(CMD_RTC_WRITE, bytes([0, 0, 0, 0, 0, 0, 1]))    # expect 04 28 00 01 ...
+        step(CMD_GENERAL_SETTINGS, body, trailer=True)       # expect echo of body
         resp = step(CMD_COMMIT)                 # expect 04 02 00 01
         if len(resp) >= 4 and resp[3] != 0x01:
             print(f"warning: commit status {resp[3]:#04x} (capture saw 0x01); "
@@ -761,16 +996,8 @@ class AulaS75Pro:
         verify: bool = True,
         is_live_ram: bool = False,
     ) -> tuple[list[bytes], int]:
-        """Execute a State-1 read transaction (0x0504, 0x1004, 0x1204, 0x1404, 0x1604, 0x2204, 0x2604, 0xF504).
-
-        Handles both firmware paths from 0x00004330 + FUN_0000407a:
-          - Stale usb_flags bit 1: SET_REPORT auto-advances to State 1 and
-            FUN_0000407a preloads chunk 0 before the first GET_REPORT, so GET #1
-            returns chunk 0 directly.
-          - Clean usb_flags bit 1 (after 0x0204+GET, or for 0xF504 which clears
-            bit 1 in Phase 1): GET #1 returns [04, cmd_hi, 00, 01, ...], then
-            chunks 0..N-1 follow on subsequent GET_REPORTs.
-        """
+        """Execute a State-1 read transaction (wired USB only)."""
+        self._require_wired(f"State-1 read 0x{cmd:04X}")
         if chunks < 1:
             raise ValueError(f"chunks must be >= 1, got {chunks}")
 
@@ -845,15 +1072,13 @@ class AulaS75Pro:
                 keys[slot_idx] = (raw[off + 1], raw[off + 2], raw[off + 3])
         return keys
 
-    def read_device_info(self) -> dict:
-        """Read firmware/device info block from flash 0x00008F80 via CMD_DEVICE_INFO (0x0504)."""
-        chunks, mcu_sum = self._read_state1_chunks(CMD_DEVICE_INFO, chunks=1)
-        chunk = chunks[0]
-        tag = struct.unpack_from("<H", chunk, 0)[0]
-        vid = struct.unpack_from("<H", chunk, 4)[0]
-        pid = struct.unpack_from("<H", chunk, 6)[0]
-        fw_minor = chunk[8]
-        fw_major = chunk[9]
+    @staticmethod
+    def _unpack_device_info_block(block: bytes) -> dict:
+        tag = struct.unpack_from("<H", block, 0)[0]
+        vid = struct.unpack_from("<H", block, 4)[0]
+        pid = struct.unpack_from("<H", block, 6)[0]
+        fw_minor = block[8]
+        fw_major = block[9]
         return {
             "tag": tag,
             "vid": vid,
@@ -861,12 +1086,43 @@ class AulaS75Pro:
             "fw_major": fw_major,
             "fw_minor": fw_minor,
             "fw_version": f"{fw_major}.{fw_minor:02d}",
+        }
+
+    def read_device_info(self) -> dict:
+        """Read firmware/device info block from flash 0x00008F80 (wired 0x0504 or 2.4G 0x02)."""
+        if self.is_dongle:
+            reply = self._dongle_transact(DONGLE_CMD_INFO, 0x00, 0x00)
+            block = reply[3:31]
+            return {
+                **self._unpack_device_info_block(block),
+                "checksum": None,
+                "transport": "dongle",
+                "raw": block,
+            }
+        chunks, mcu_sum = self._read_state1_chunks(CMD_DEVICE_INFO, chunks=1)
+        chunk = chunks[0]
+        return {
+            **self._unpack_device_info_block(chunk),
             "checksum": mcu_sum,
+            "transport": "usb",
             "raw": chunk,
         }
 
     def read_battery_level(self, delay: float = 0.036) -> dict:
-        """Read quantized battery level (0-5) from RAM 0x200000F8 via CMD_BATTERY_LEVEL (0xF604)."""
+        """Read battery level: quantized 0-5 in wired mode (0xF604) or exact 0-100% over 2.4G (0x20)."""
+        if self.is_dongle:
+            reply = self._dongle_transact(DONGLE_CMD_BATTERY, 0x01, 0x00)
+            if len(reply) < 4:
+                raise RuntimeError(f"2.4G battery reply too short: {reply.hex()}")
+            percent = reply[3]
+            level = battery_percent_to_level(percent)
+            return {
+                "level": level,
+                "percent": percent,
+                "percent_range": BATTERY_RANGES.get(level, "unknown"),
+                "transport": "dongle",
+                "raw": reply,
+            }
         self.raw_send(bytes(build_report(CMD_BATTERY_LEVEL)))
         if delay:
             time.sleep(delay)
@@ -886,12 +1142,15 @@ class AulaS75Pro:
         level = resp[4]
         return {
             "level": level,
+            "percent": None,
             "percent_range": BATTERY_RANGES.get(level, "unknown"),
+            "transport": "usb",
             "raw": resp,
         }
 
     def read_lighting_config(self) -> dict:
         """Read saved main-key lighting config from flash 0x00009800 via CMD_LIGHTING_READ (0x1204)."""
+        self._require_wired("read_lighting_config()")
         chunks, mcu_sum = self._read_state1_chunks(CMD_LIGHTING_READ, chunks=1)
         chunk = chunks[0]
         return {
@@ -910,6 +1169,7 @@ class AulaS75Pro:
 
     def read_general_settings(self) -> dict:
         """Read saved general settings page from flash 0x00009000 via CMD_SETTINGS_READ (0x1604)."""
+        self._require_wired("read_general_settings()")
         chunks, mcu_sum = self._read_state1_chunks(CMD_SETTINGS_READ, chunks=1)
         chunk = chunks[0]
         sleep_time = chunk[6]
@@ -931,6 +1191,7 @@ class AulaS75Pro:
 
     def read_live_rgb(self, chunks: int = TABLE_CHUNKS) -> dict:
         """Read live RGB RAM arrays (0x20001838/195E/1A84) via CMD_LIGHT_READ (0xF504)."""
+        self._require_wired("read_live_rgb()")
         raw_chunks, mcu_sum = self._read_state1_chunks(
             CMD_LIGHT_READ, chunks=chunks, is_live_ram=True
         )
@@ -943,6 +1204,7 @@ class AulaS75Pro:
 
     def read_custom_lighting_table(self, chunks: int = TABLE_CHUNKS) -> dict:
         """Read saved custom RGB table from flash 0x00009C00 via CMD_CUSTOM_LIGHT_READ (0x2204)."""
+        self._require_wired("read_custom_lighting_table()")
         raw_chunks, mcu_sum = self._read_state1_chunks(CMD_CUSTOM_LIGHT_READ, chunks=chunks)
         raw = b"".join(raw_chunks)
         return {
@@ -955,32 +1217,25 @@ class AulaS75Pro:
     def set_underglow_mode(self, mode: int | str, preserve_lighting: bool = True) -> dict:
         """
         Set Row-6 side / underglow lighting mode (0=flowing, 1=spectrum, 2=static,
-        3=breathing, 4=off) via CMD_LIGHTING_WRITE (0x1304, payload[0] = 0x20 + mode).
+        3=breathing, 4=off) via wired 0x1304 or 2.4G 0x05 (payload[0] = 0x20 + mode).
 
-        Because 0x1304 Phase 1 erases flash page 0x00009800 before FUN_00003f42
-        skips writing it for 0x20-0x24, preserve_lighting=True (default) reads
-        0x9800 via 0x1204 beforehand and rewrites it afterward if populated.
+        In wired mode, 0x1304 Phase 1 erases flash page 0x00009800 before FUN_00003f42
+        skips writing it for 0x20-0x24, so preserve_lighting=True reads and restores 0x9800.
+        Over 2.4G, FUN_00005990 opcode 0x05 updates 0x20000194 directly without erasing 0x9800.
         """
-        if isinstance(mode, bool):
-            raise ValueError(f"Invalid underglow mode: {mode!r}")
-        if isinstance(mode, str):
-            key = mode.strip().lower()
-            if key in UNDERGLOW_MODES:
-                mode_id = UNDERGLOW_MODES[key]
-            elif key.isdigit():
-                mode_id = int(key)
-            else:
-                raise ValueError(
-                    f"Unknown underglow mode {mode!r}; "
-                    f"expected {', '.join(UNDERGLOW_MODES)} or 0-4."
-                )
-        elif isinstance(mode, int):
-            mode_id = mode
-        else:
-            raise ValueError(f"Invalid underglow mode type: {type(mode).__name__}")
+        mode_id = _parse_underglow_mode(mode)
 
-        if not (0 <= mode_id <= 4):
-            raise ValueError(f"Underglow mode must be 0-4, got {mode_id}")
+        if self.is_dongle:
+            payload_16 = bytes([0x20 + mode_id]) + bytes(13) + TRAILER
+            self._dongle_transact(DONGLE_CMD_LIGHTING, DONGLE_SETTINGS_LEN, 0x00, payload_16)
+            return {
+                "mode": mode_id,
+                "mode_name": UNDERGLOW_MODE_NAMES[mode_id],
+                "checksum": None,
+                "checksum_matched": None,
+                "restored_lighting": False,
+                "transport": "dongle",
+            }
 
         saved = self.read_lighting_config() if preserve_lighting else None
 
@@ -1032,6 +1287,35 @@ class AulaS75Pro:
             "checksum": mcu_sum,
             "checksum_matched": checksum_matched,
             "restored_lighting": restored,
+            "transport": "usb",
         }
+
+    def send_wireless_music_eq(
+        self,
+        heights,
+        fg_style: int = 1,
+        bg_style: int = 0,
+        mode: int = 0,
+    ) -> bytes:
+        """Send a 15-column x 6-row 2.4G wireless music EQ frame via opcode 0x0B (len=0x1C).
+
+        Firmware FUN_00005990 accepts fg_style/bg_style (0-11), mode (0-255),
+        and 15 column heights clamped to 0-6 rows; per-key freeform RGB
+        streaming (0x2004) is wired USB only.
+        """
+        self._require_dongle("send_wireless_music_eq (0x0B)")
+        for label, val, hi in (("fg_style", fg_style, 11), ("bg_style", bg_style, 11), ("mode", mode, 255)):
+            if isinstance(val, bool) or not isinstance(val, int) or not (0 <= val <= hi):
+                raise ValueError(f"{label} must be an int in range 0..{hi}, got {val!r}")
+        cols = list(heights)
+        if len(cols) != 15:
+            raise ValueError(f"heights must have exactly 15 columns, got {len(cols)}")
+        clamped: list[int] = []
+        for i, h in enumerate(cols):
+            if isinstance(h, bool):
+                raise ValueError(f"column {i} height must be int 0..6, got bool")
+            clamped.append(max(0, min(6, int(h))))
+        payload = bytes([fg_style, bg_style, mode] + clamped)
+        return self._dongle_transact(DONGLE_CMD_MUSIC_EQ, DONGLE_PAYLOAD_LEN, 0x00, payload)
 
 

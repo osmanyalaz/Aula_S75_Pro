@@ -1,12 +1,8 @@
-# AULA S75 Pro — USB RGB Protocol (reverse-engineered)
+# AULA S75 Pro — USB & 2.4GHz Dongle Protocol (reverse-engineered)
 
-Reverse-engineered control protocol for the AULA S75 Pro (VID `0x0C45`, PID `0x800A`,
-wired USB mode). Built from Wireshark/usbmon captures of the official Windows driver
-(running under Wine), the driver's Ghidra decompilation, the keyboard MCU firmware
-(v1.03). Everything in the "verified"
-sections was confirmed on real hardware unless marked otherwise.
+Reverse-engineered control protocol for the AULA S75 Pro across **wired USB** (`VID=0x0C45`, `PID=0x800A`) and the **2.4GHz wireless dongle** (`VID=0x05AC`, `PID=0x024F`, `iProduct="2.4G Dongle"`). Built from Wireshark/usbmon captures, `lsusb` captures of wired/dongle descriptors, the official Windows driver's Ghidra decompilation (`DeviceDriver.exe.c`), and the keyboard MCU firmware (`v1.03`).
 
-## 1. Transport
+## 1. Wired USB Transport (`0x0C45:0x800A`)
 
 From the firmware USB descriptor table (`0x000140F0`, Configuration Descriptor `0x00014056`, length `0x74`), the AULA S75 Pro (`VID=0x0C45`, `PID=0x800A`) exposes **4 USB HID interfaces**:
 
@@ -23,6 +19,32 @@ bmRequestType 0xA1 | bRequest 0x01 (GET_REPORT) | wValue 0x0300 | wIndex 0x0003 
 ```
 
 Report ID 0; the 64-byte payload follows. hidapi: `send_feature_report(b"\x00" + payload)` / `get_feature_report(0, 65)`. Interface 0 shares the same EP0 handler (`FUN_00001d2e` → `FUN_00001924` / `0x00001C38`), while Interface 3 is the dedicated vendor control interface.
+
+## 1b. 2.4GHz Dongle Transport (`0x05AC:0x024F`) & Bluetooth Gate
+
+- **Real Hardware IDs (`lsusb` + `DeviceDriver.exe.c`):** Although `config.xml` lists `0x0C45:0xFEFE`, the physical 2.4GHz receiver enumerates as **`VID=0x05AC, PID=0x024F`** with `iProduct = "2.4G Dongle"` (with `0x0C45:0xFEFE` kept only as a secondary fallback).
+- **Interface 3 Requirement:** On `05AC:024F`, **Interface 3** (`EP 0x85 IN` / `EP 0x05 OUT`, `wMaxPacketSize = 32`, `usage_page = 0xFFxx` on Windows) is the vendor 2.4G control pipe, whereas **Interface 4** (`EP 0x86 IN` / `EP 0x06 OUT`, `wMaxPacketSize = 64`) is a separate vendor interface. Discovery **must require `interface_number == 3`** (never match solely on `usage_page >= 0xFF00`) and **must NOT call `get_feature_report(0, 65)`** on the dongle.
+- **Bluetooth Mode (`DAT_200000ea == 1`) — Unsupported in Firmware:** Main-loop dispatch `FUN_00004798` gates wireless packet handling (`FUN_00005990`) strictly on **`DAT_200000ea == 2`** (2.4G mode), while wired `FUN_000002ec` only runs when `DAT_200000ea == 0`. Firmware v1.03 has **no** vendor configuration/RGB control protocol over Bluetooth (standard BLE HID only).
+
+### 33-Byte Interrupt Framing (`FUN_0044f4d0` / `FUN_00451130` / `FUN_00451210`)
+- **Host → Dongle (`hid.device.write`, 33 bytes):**
+  `[0x00 (Report ID), cmd, length, seq, payload[0..27], sum(bytes[0..31]) & 0xFF]`
+- **Dongle → Host (`hid.device.read(33, timeout_ms)`):**
+  Echoes `[cmd, length, seq, ...]` (Linux `hidraw` returns `32` bytes without Report ID 0; Windows/`libusb` returns `33` bytes prefixed by `0x00`). Official driver drains stale reports, writes once (retried after 10 ms on failure), sleeps 5 ms, then polls Interrupt IN.
+
+### 2.4G Opcodes (`FUN_00005990` / `FUN_0044f980`)
+
+| Cmd | Len | Seq | Payload / Response | Purpose |
+|---|---|---|---|---|
+| `0x02` | `0x00` | `0` | Reply `[02, 00, 00, <0x8F80[0..27]>]` | **Link probe & Device Info** (`tag`, `vid`, `pid`, `fw_version`). |
+| `0x20` | `0x01` | `0` | Reply `[20, 01, 00, percent]` | **Exact Battery % (`0–100`)** (`DAT_200000f9`; levels via `FUN_00004d8c`). |
+| `0x05` | `0x10` | `0` | `[effect, r, g, b, 0,0,0,0, opt, bri, spd, dir, 0,0, AA, 55]` | Global lighting (`0x00–0x13`, `0x80`) or **Row-6 underglow (`0x20–0x24`, no `0x9800` erase)**. |
+| `0x07` | `0x10` | `0` | `[00, 01, alt_tab, alt_f4, win_lock, fn, sleep, 00, resp, 0..0, AA, 55]` | General settings (`0x01` header + trailer). |
+| `0x0C` | `0x10` | `0` | `[00, 01, 5A, yy, mm, dd, HH, MM, SS, 00, wd, 00, 00, 00, AA, 55]` | RTC time sync. |
+| `0x14` | `0x1C` / `0x10` | `0..20` | 21 chunks (`20 × 28 B` + `1 × 16 B` = `576 B`) | Custom per-key RGB table (sent after `0x05` `effect=0x80`, 2 ms gap). |
+| `0x0B` | `0x1C` | `0` | `[fg_style(0..11), bg_style(0..11), mode, col0..col14(0..6), 0..0]` | **Wireless 15-column × 6-row live music EQ** (`send_wireless_music_eq()`). |
+
+**Wired-only operations (unavailable over 2.4G):** TFT image/GIF upload (`0x7204` / Interface 2), State-1 flash/RAM read-back (`0x0504` raw chunks, `0x1204`, `0x1604`, `0x2204`, `0xF504`), raw 64 B Feature reports, and freeform per-key `0x2004` streaming.
 
 ## 2. HID State Machine (`FUN_00004622`), Opcodes & Transaction Model
 
@@ -301,9 +323,11 @@ to ensure the MCU animation pointers and flash buffers latch cleanly:
 
 ### Provenance
 - `musicRGB.pcapng` / `musicRGB2.pcapng`, `escToRed.pcapng`, `UserLightning-singleKeyChange.pcapng`, `Static.pcapng`, `SideLightsRed.pcapng`.
+- Wired & 2.4G dongle `lsusb` descriptor captures (`0x0C45:0x800A` and `0x05AC:0x024F` `"2.4G Dongle"`).
 - `DeviceDriver.exe.c` & `s75pro_fw_v1.03.bin` (SHA-256 `7ef0d72f267621beef543a8068602db253872a5a2a0291e4ccdb1a651e669e22`, base `0x00000000`; see [`FIRMWARE_AUDIT.md`](FIRMWARE_AUDIT.md)).
 
 ### Explicit Safety Exclusions (DO NOT IMPLEMENT OR EXPOSE)
 - **Opcode `0x3804` (`04 38`, `0x0000459E` → State 5):** Writes `EP 3 OUT` 4096 B chunks to external SPI flash starting at **`0x00000000`**, overwriting factory TFT splash screens, menus, icons, and language tables (`0x00172444`, `0x00182164`, `0x00236B3C`).
 - **EP0 ISP Bootloader Magic (`AA 42 89 5A FF 71 62 CC` → `FUN_00001924` / `FUN_0000187e` → `FUN_0000014c()`):** Immediately disables interrupts/peripherals and jumps into the MCU ROM ISP bootloader; malformed writes can brick the keyboard.
+- **Wireless OTA / Bootloader Opcodes (`0x7F`, `0x80–0x8F` in `FUN_00005990`):** Wireless firmware flashing path; excluded to avoid bricking the dongle/keyboard over RF.
 - **Safe idioms:** `0x2004` streaming writes RAM only (zero flash wear); keep flash-writing commands (`0x11`, `0x13`, `0x15`, `0x17`, `0x23`, `0x27`) for occasional config updates and `0x7204` (`0x00750000` only) within the `140`-frame / `32–510 ms` bounds.

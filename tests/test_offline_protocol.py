@@ -263,6 +263,106 @@ def make_mock_kb(mock_dev: MockS75ProDevice) -> lib.AulaS75Pro:
     return kb
 
 
+class MockDongleDevice:
+    """In-memory simulator for the 2.4GHz dongle Interrupt IN/OUT protocol (FUN_00005990)."""
+
+    def __init__(
+        self,
+        *,
+        battery_percent: int = 73,
+        include_report_id: bool = False,
+        stale_replies: list[bytes] | None = None,
+    ):
+        self.battery_percent = battery_percent
+        self.include_report_id = include_report_id
+        self.in_queue: list[bytes] = list(stale_replies or [])
+        self.written_packets: list[bytes] = []
+        self.closed = False
+
+        info = bytearray([0xFF] * 28)
+        info[0:10] = bytes.fromhex("40300000450c0a800301")
+        self.info_block = bytes(info)
+
+        self.last_lighting: bytes | None = None
+        self.last_underglow: bytes | None = None
+        self.last_settings: bytes | None = None
+        self.last_rtc: bytes | None = None
+        self.last_music_eq: bytes | None = None
+        self.custom_chunks: dict[int, bytes] = {}
+
+    def open_path(self, path: bytes) -> None:
+        return None
+
+    def set_nonblocking(self, flag: bool) -> None:
+        return None
+
+    def get_feature_report(self, report_id: int, length: int) -> bytes:
+        raise AssertionError("get_feature_report() must never be called on the 2.4G dongle")
+
+    def send_feature_report(self, data: bytes) -> int:
+        raise AssertionError("send_feature_report() must never be called on the 2.4G dongle")
+
+    def _enqueue_reply(self, cmd: int, length: int, seq: int, payload: bytes = b"") -> None:
+        frame = bytearray(32)
+        frame[0] = cmd
+        frame[1] = length
+        frame[2] = seq
+        frame[3 : 3 + len(payload)] = payload
+        if self.include_report_id:
+            self.in_queue.append(b"\x00" + bytes(frame))
+        else:
+            self.in_queue.append(bytes(frame))
+
+    def write(self, data: bytes) -> int:
+        pkt = bytes(data)
+        assert len(pkt) == 33, f"Expected 33-byte 2.4G OUT packet, got {len(pkt)}"
+        assert pkt[0] == 0x00, f"Expected Report ID 0x00, got 0x{pkt[0]:02x}"
+        expected_chk = sum(pkt[:32]) & 0xFF
+        assert pkt[32] == expected_chk, f"Checksum mismatch: 0x{pkt[32]:02x} != 0x{expected_chk:02x}"
+        self.written_packets.append(pkt)
+
+        cmd, length, seq = pkt[1], pkt[2], pkt[3]
+        payload = pkt[4 : 4 + length]
+        if cmd == lib.DONGLE_CMD_INFO:
+            self._enqueue_reply(cmd, length, seq, self.info_block)
+        elif cmd == lib.DONGLE_CMD_BATTERY:
+            self._enqueue_reply(cmd, length, seq, bytes([self.battery_percent & 0xFF]))
+        elif cmd == lib.DONGLE_CMD_LIGHTING:
+            if (payload[0] >> 4) == 2:
+                self.last_underglow = payload
+            else:
+                self.last_lighting = payload
+            self._enqueue_reply(cmd, length, seq, payload[:16])
+        elif cmd == lib.DONGLE_CMD_SETTINGS:
+            self.last_settings = payload
+            self._enqueue_reply(cmd, length, seq, payload[:16])
+        elif cmd == lib.DONGLE_CMD_RTC:
+            self.last_rtc = payload
+            self._enqueue_reply(cmd, length, seq, payload[:16])
+        elif cmd == lib.DONGLE_CMD_CUSTOM_RGB:
+            self.custom_chunks[seq] = payload
+            self._enqueue_reply(cmd, length, seq)
+        elif cmd == lib.DONGLE_CMD_MUSIC_EQ:
+            self.last_music_eq = payload
+            self._enqueue_reply(cmd, length, seq)
+        return len(pkt)
+
+    def read(self, length: int, timeout_ms: int = 0) -> bytes:
+        assert length == lib.DONGLE_PACKET_LEN
+        if not self.in_queue:
+            return b""
+        return self.in_queue.pop(0)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def make_mock_dongle_kb(mock_dev: MockDongleDevice) -> lib.AulaS75Pro:
+    kb = lib.AulaS75Pro(mode="dongle")
+    kb.dev = mock_dev
+    return kb
+
+
 class SafetyAndConstantsTests(unittest.TestCase):
     def test_command_constants_and_wire_endianness(self):
         self.assertEqual(lib.CMD_LIGHT_READ, 0xF504)
@@ -275,6 +375,17 @@ class SafetyAndConstantsTests(unittest.TestCase):
         self.assertEqual(lib.CMD_SETTINGS_WRITE, 0x1704)
         self.assertEqual(lib.CMD_PROBE, lib.CMD_SETTINGS_WRITE)
         self.assertEqual(lib.CMD_BATTERY_LEVEL, 0xF604)
+        self.assertEqual(lib.VID_DONGLE, 0x05AC)
+        self.assertEqual(lib.PID_DONGLE, 0x024F)
+        self.assertEqual(lib.DONGLE_PRODUCT_NAME, "2.4G Dongle")
+        self.assertEqual(lib.INTERFACE_DONGLE, 3)
+        self.assertEqual(lib.DONGLE_CMD_INFO, 0x02)
+        self.assertEqual(lib.DONGLE_CMD_LIGHTING, 0x05)
+        self.assertEqual(lib.DONGLE_CMD_SETTINGS, 0x07)
+        self.assertEqual(lib.DONGLE_CMD_MUSIC_EQ, 0x0B)
+        self.assertEqual(lib.DONGLE_CMD_RTC, 0x0C)
+        self.assertEqual(lib.DONGLE_CMD_CUSTOM_RGB, 0x14)
+        self.assertEqual(lib.DONGLE_CMD_BATTERY, 0x20)
 
     def test_no_dangerous_opcodes_or_bootloader_magic_in_python_sources(self):
         py_files = [
@@ -835,6 +946,206 @@ class ScreenUploaderTests(unittest.TestCase):
             if exp_count == 140:
                 self.assertIn("140-frame device limit", out.getvalue())
 
+    def test_pyusb_backend_reports_wired_only_when_24g_dongle_connected(self):
+        import types
+
+        dongle_usb_dev = types.SimpleNamespace(product="2.4G Dongle")
+        apple_usb_dev = types.SimpleNamespace(product="Apple Keyboard")
+
+        def fake_find_dongle(idVendor=None, idProduct=None):
+            if (idVendor, idProduct) == (screen.DONGLE_VENDOR_ID, screen.DONGLE_PRODUCT_ID):
+                return dongle_usb_dev
+            return None
+
+        fake_usb_core = types.SimpleNamespace(find=fake_find_dongle)
+        fake_usb_pkg = types.SimpleNamespace(core=fake_usb_core)
+        with mock.patch.dict(sys.modules, {"usb": fake_usb_pkg, "usb.core": fake_usb_core}):
+            with self.assertRaises(SystemExit) as ctx:
+                screen.PyUsbBackend()
+        msg = str(ctx.exception)
+        self.assertIn("2.4G wireless dongle detected", msg)
+        self.assertIn("0x05ac", msg.lower())
+        self.assertIn("wired USB only", msg)
+
+        def fake_find_apple(idVendor=None, idProduct=None):
+            if (idVendor, idProduct) == (screen.DONGLE_VENDOR_ID, screen.DONGLE_PRODUCT_ID):
+                return apple_usb_dev
+            return None
+
+        fake_usb_core2 = types.SimpleNamespace(find=fake_find_apple)
+        fake_usb_pkg2 = types.SimpleNamespace(core=fake_usb_core2)
+        with mock.patch.dict(sys.modules, {"usb": fake_usb_pkg2, "usb.core": fake_usb_core2}):
+            with self.assertRaises(SystemExit) as ctx2:
+                screen.PyUsbBackend()
+        self.assertIn("Keyboard not found", str(ctx2.exception))
+
+
+class DongleProtocolTests(unittest.TestCase):
+    def setUp(self):
+        self.sleep_patcher = mock.patch("time.sleep", return_value=None)
+        self.sleep_patcher.start()
+
+    def tearDown(self):
+        self.sleep_patcher.stop()
+
+    def test_dongle_discovery_requires_iface3_and_product_without_feature_get(self):
+        entries = [
+            {"vendor_id": 0x05AC, "product_id": 0x024F, "interface_number": 3, "usage_page": 0xFF00, "product_string": "Apple Keyboard", "path": b"apple-kbd"},
+            {"vendor_id": 0x05AC, "product_id": 0x024F, "interface_number": 4, "usage_page": 0xFF00, "product_string": "2.4G Dongle", "path": b"dongle-if4"},
+            {"vendor_id": 0x05AC, "product_id": 0x024F, "interface_number": 3, "usage_page": 0, "product_string": "2.4G Dongle", "path": b"dongle-if3"},
+        ]
+        opened_paths = []
+        mock_dev = MockDongleDevice()
+
+        def fake_enumerate(vid=0, pid=0):
+            return [e for e in entries if (vid == 0 or e["vendor_id"] == vid) and (pid == 0 or e["product_id"] == pid)]
+
+        def make_hid_dev():
+            class Wrapper:
+                def open_path(self, p):
+                    opened_paths.append(p)
+                    return mock_dev.open_path(p)
+                def set_nonblocking(self, flag):
+                    return mock_dev.set_nonblocking(flag)
+                def write(self, data):
+                    return mock_dev.write(data)
+                def read(self, length, timeout_ms=0):
+                    return mock_dev.read(length, timeout_ms)
+                def get_feature_report(self, rid, length):
+                    return mock_dev.get_feature_report(rid, length)
+                def close(self):
+                    return mock_dev.close()
+            return Wrapper()
+
+        with (
+            mock.patch.object(lib.hid, "enumerate", side_effect=fake_enumerate),
+            mock.patch.object(lib.hid, "device", side_effect=make_hid_dev),
+        ):
+            kb = lib.AulaS75Pro(mode="auto")
+            kb.open()
+            try:
+                self.assertEqual(kb.active_mode, "dongle")
+                self.assertEqual(kb.vid, 0x05AC)
+                self.assertEqual(kb.pid, 0x024F)
+                self.assertEqual(kb.interface, 3)
+                self.assertEqual(opened_paths, [b"dongle-if3"])
+            finally:
+                kb.close()
+
+        # Also test auto prefers wired USB over dongle when both exist, and 0C45:FEFE fallback
+        entries_with_usb = entries + [
+            {"vendor_id": 0x0C45, "product_id": 0x800A, "interface_number": 3, "usage_page": 0, "product_string": "AULA-S75Pro", "path": b"usb-if3"}
+        ]
+        with mock.patch.object(lib.hid, "enumerate", side_effect=lambda v=0, p=0: [e for e in entries_with_usb if e["vendor_id"] == v and e["product_id"] == p]):
+            kb_usb = lib.AulaS75Pro(mode="auto")
+            self.assertEqual(kb_usb.find_path(), b"usb-if3")
+            self.assertEqual(kb_usb.active_mode, "usb")
+
+        fb_entries = [
+            {"vendor_id": 0x0C45, "product_id": 0xFEFE, "interface_number": 3, "usage_page": 0, "product_string": "2.4G", "path": b"fb-if3"}
+        ]
+        with mock.patch.object(lib.hid, "enumerate", side_effect=lambda v=0, p=0: [e for e in fb_entries if e["vendor_id"] == v and e["product_id"] == p]):
+            kb_fb = lib.AulaS75Pro(mode="dongle")
+            self.assertEqual(kb_fb.find_path(), b"fb-if3")
+            self.assertEqual((kb_fb.vid, kb_fb.pid), (0x0C45, 0xFEFE))
+
+    def test_dongle_framing_checksum_reply_normalization_and_battery_levels(self):
+        pkt = lib.build_dongle_packet(0x05, 0x10, 0x00, bytes([1, 255, 0, 0]))
+        self.assertEqual(len(pkt), 33)
+        self.assertEqual(pkt[0:4], bytes([0x00, 0x05, 0x10, 0x00]))
+        self.assertEqual(pkt[4:8], bytes([1, 255, 0, 0]))
+        self.assertEqual(pkt[32], sum(pkt[:32]) & 0xFF)
+
+        body_32 = bytes([0x20, 0x01, 0x00, 88]) + bytes(28)
+        self.assertEqual(lib.parse_dongle_reply(body_32), body_32)
+        self.assertEqual(lib.parse_dongle_reply(b"\x00" + body_32), body_32)
+
+        for pct, exp_lvl in ((0, 0), (5, 0), (6, 1), (25, 1), (26, 2), (50, 2), (51, 3), (75, 3), (76, 4), (95, 4), (96, 5), (100, 5)):
+            self.assertEqual(lib.battery_percent_to_level(pct), exp_lvl)
+
+    def test_dongle_probe_info_battery_and_stale_drain(self):
+        stale = [bytes([0x99] + [0] * 31)]
+        dev = MockDongleDevice(battery_percent=82, include_report_id=True, stale_replies=stale)
+        kb = make_mock_dongle_kb(dev)
+
+        probe = kb.ping_dongle()
+        self.assertEqual(probe[0:3], bytes([0x02, 0x00, 0x00]))
+
+        info = kb.read_device_info()
+        self.assertEqual(info["tag"], 0x3040)
+        self.assertEqual((info["vid"], info["pid"]), (0x0C45, 0x800A))
+        self.assertEqual(info["fw_version"], "1.03")
+        self.assertIsNone(info["checksum"])
+        self.assertEqual(info["transport"], "dongle")
+
+        batt = kb.read_battery_level()
+        self.assertEqual(batt["percent"], 82)
+        self.assertEqual(batt["level"], 4)
+        self.assertEqual(batt["percent_range"], "76–95%")
+        self.assertEqual(batt["transport"], "dongle")
+
+    def test_dongle_lighting_underglow_settings_rtc_and_custom_rgb(self):
+        from datetime import datetime
+
+        dev = MockDongleDevice()
+        kb = make_mock_dongle_kb(dev)
+
+        kb.set_global_lighting(effect=1, r=12, g=34, b=56, brightness=4, speed=2, direction=1, option=0)
+        self.assertEqual(dev.last_lighting, bytes([1, 12, 34, 56, 0, 0, 0, 0, 0, 4, 2, 1, 0, 0, 0xAA, 0x55]))
+
+        ug = kb.set_underglow_mode("static", preserve_lighting=True)
+        self.assertEqual(ug["mode"], 2)
+        self.assertEqual(ug["mode_name"], "static")
+        self.assertIsNone(ug["checksum"])
+        self.assertFalse(ug["restored_lighting"])
+        self.assertEqual(dev.last_underglow, bytes([0x22]) + bytes(13) + b"\xaa\x55")
+
+        kb.write_general_settings(fn_switch=1, sleep_time=3, key_response_time=2, disable_alt_tab=True, win_lock=True)
+        self.assertEqual(dev.last_settings, bytes([0x00, 0x01, 1, 0, 1, 1, 3, 0, 2, 0, 0, 0, 0, 0, 0xAA, 0x55]))
+
+        kb.sync_rtc(when=datetime(2026, 11, 26, 1, 2, 3))
+        self.assertEqual(dev.last_rtc, bytes([0x00, 0x01, 0x5A, 26, 11, 26, 1, 2, 3, 0, 4, 0, 0, 0, 0xAA, 0x55]))
+
+        esc_idx = lib.KEYMAP["Esc"]
+        kb.set_custom_lighting({esc_idx: (200, 100, 50)}, brightness=3)
+        self.assertEqual(dev.last_lighting[0], 0x80)
+        self.assertEqual(dev.last_lighting[9], 3)
+        self.assertEqual(len(dev.custom_chunks), 21)
+        for seq in range(20):
+            self.assertEqual(len(dev.custom_chunks[seq]), 28)
+        self.assertEqual(len(dev.custom_chunks[20]), 16)
+        assembled = b"".join(dev.custom_chunks[i] for i in range(21))
+        self.assertEqual(len(assembled), 576)
+        self.assertEqual(assembled[esc_idx * 4 : esc_idx * 4 + 4], bytes([esc_idx, 200, 100, 50]))
+        self.assertEqual(assembled[574:576], b"\xaa\x55")
+
+    def test_dongle_music_eq_and_mode_guards(self):
+        dev = MockDongleDevice()
+        kb = make_mock_dongle_kb(dev)
+
+        kb.send_wireless_music_eq([-1, 0, 1, 2, 3, 4, 5, 6, 9, 5, 4, 3, 2, 1, 0], fg_style=3, bg_style=1, mode=2)
+        self.assertEqual(dev.last_music_eq[:18], bytes([3, 1, 2, 0, 0, 1, 2, 3, 4, 5, 6, 6, 5, 4, 3, 2, 1, 0]))
+
+        with self.assertRaises(ValueError):
+            kb.send_wireless_music_eq([0] * 14)
+        with self.assertRaises(ValueError):
+            kb.send_wireless_music_eq([0] * 15, fg_style=12)
+
+        for call in (
+            lambda: kb.raw_send(bytes(64)),
+            lambda: kb.raw_get(),
+            lambda: kb.read_lighting_config(),
+            lambda: kb.read_general_settings(),
+            lambda: kb.read_live_rgb(),
+            lambda: kb.read_custom_lighting_table(),
+        ):
+            with self.assertRaises(lib.UnsupportedModeError):
+                call()
+
+        usb_kb = make_mock_kb(MockS75ProDevice())
+        with self.assertRaises(lib.UnsupportedModeError):
+            usb_kb.send_wireless_music_eq([0] * 15)
+
 
 class CliMockTests(unittest.TestCase):
     def setUp(self):
@@ -904,6 +1215,69 @@ class CliMockTests(unittest.TestCase):
 
         out_kr = self._run_cli(dev, ["set-key-response", "3", "--disable-alt-tab", "--win-lock"])
         self.assertIn("Device ack:", out_kr)
+
+    def test_cli_dongle_mode_info_battery_underglow_color_custom_scan_and_guard(self):
+        dev = MockDongleDevice(battery_percent=64)
+
+        def run_dongle(argv):
+            def fake_open(kb_self):
+                kb_self._transport = "dongle"
+                kb_self.vid = 0x05AC
+                kb_self.pid = 0x024F
+                kb_self.interface = 3
+                kb_self.dev = dev
+                kb_self.ping_dongle()
+                return kb_self
+
+            buf = io.StringIO()
+            err = io.StringIO()
+            with (
+                mock.patch.object(lib.AulaS75Pro, "open", fake_open),
+                mock.patch.object(sys, "argv", ["cli.py"] + argv),
+                contextlib.redirect_stdout(buf),
+                contextlib.redirect_stderr(err),
+            ):
+                cli.main()
+            return buf.getvalue(), err.getvalue()
+
+        out_info, _ = run_dongle(["--mode", "dongle", "info", "--raw"])
+        self.assertIn("Connected (dongle): VID=05AC PID=024F interface=3", out_info)
+        self.assertIn("Device Info (2.4G 0x02):", out_info)
+        self.assertIn("FW=v1.03", out_info)
+
+        out_batt, _ = run_dongle(["--mode", "dongle", "battery"])
+        self.assertIn("Battery (2.4G 0x20): 64% (level 3/5, 51–75%)", out_batt)
+
+        out_ug, _ = run_dongle(["--mode", "dongle", "underglow", "static"])
+        self.assertIn("Underglow mode 2 (static) applied via 2.4G dongle (0x05)", out_ug)
+
+        out_col, _ = run_dongle(["--mode", "dongle", "color", "10", "20", "30", "--effect", "static"])
+        self.assertIn("Set color to RGB(10, 20, 30) using effect ID 1", out_col)
+
+        out_custom, _ = run_dongle(["--mode", "dongle", "custom", "255", "0", "0", "--keys", "Esc"])
+        self.assertIn("Applied RGB(255, 0, 0)", out_custom)
+
+        out_clk, _ = run_dongle(["--mode", "dongle", "sync-clock"])
+        self.assertIn("Keyboard RTC synced", out_clk)
+
+        with self.assertRaises(SystemExit) as ctx:
+            run_dongle(["--mode", "dongle", "read", "lighting"])
+        self.assertEqual(ctx.exception.code, 2)
+
+        scan_entries = [
+            {"vendor_id": 0x05AC, "product_id": 0x024F, "interface_number": 3, "usage_page": 0, "usage": 0, "product_string": "2.4G Dongle", "path": b"d3"},
+            {"vendor_id": 0x05AC, "product_id": 0x024F, "interface_number": 4, "usage_page": 0, "usage": 0, "product_string": "2.4G Dongle", "path": b"d4"},
+        ]
+        scan_buf = io.StringIO()
+        with (
+            mock.patch.object(lib.hid, "enumerate", return_value=scan_entries),
+            mock.patch.object(sys, "argv", ["cli.py", "scan"]),
+            contextlib.redirect_stdout(scan_buf),
+        ):
+            cli.main()
+        scan_out = scan_buf.getvalue()
+        self.assertIn("AULA 2.4G Dongle control (iface 3)", scan_out)
+        self.assertNotIn("No AULA USB", scan_out)
 
 
 if __name__ == "__main__":

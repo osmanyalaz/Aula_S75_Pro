@@ -90,8 +90,13 @@ import warnings
 from pathlib import Path
 
 # ── Device constants ──────────────────────────────────────────────────────────
-VENDOR_ID  = 0x0C45
-PRODUCT_ID = 0x800A
+VENDOR_ID                  = 0x0C45
+PRODUCT_ID                 = 0x800A
+DONGLE_VENDOR_ID           = 0x05AC
+DONGLE_PRODUCT_ID          = 0x024F
+DONGLE_PRODUCT_NAME        = "2.4G Dongle"
+DONGLE_FALLBACK_VENDOR_ID  = 0x0C45
+DONGLE_FALLBACK_PRODUCT_ID = 0xFEFE
 
 SCREEN_W   = 135   # portrait: 135 px wide
 SCREEN_H   = 240   # portrait: 240 px tall
@@ -510,6 +515,32 @@ def extract_video_frames(path: str, fit: bool, delay_override: int | None,
 
 
 # ── USB I/O (pyusb only - see note at top of file re: hidapi) ────────────────
+def _read_usb_product(dev):
+    """Best-effort read of USB product descriptor string."""
+    try:
+        return dev.product
+    except Exception:
+        return None
+
+
+def _detect_24g_dongle(usb_core):
+    """Return (vid, pid, product_name) if an AULA 2.4G wireless dongle is attached."""
+    dev = usb_core.find(idVendor=DONGLE_VENDOR_ID, idProduct=DONGLE_PRODUCT_ID)
+    if dev is not None and _read_usb_product(dev) == DONGLE_PRODUCT_NAME:
+        return (DONGLE_VENDOR_ID, DONGLE_PRODUCT_ID, DONGLE_PRODUCT_NAME)
+    fb = usb_core.find(
+        idVendor=DONGLE_FALLBACK_VENDOR_ID,
+        idProduct=DONGLE_FALLBACK_PRODUCT_ID,
+    )
+    if fb is not None:
+        return (
+            DONGLE_FALLBACK_VENDOR_ID,
+            DONGLE_FALLBACK_PRODUCT_ID,
+            _read_usb_product(fb) or DONGLE_PRODUCT_NAME,
+        )
+    return None
+
+
 class PyUsbBackend:
     name = "pyusb"
 
@@ -520,6 +551,17 @@ class PyUsbBackend:
             sys.exit("pyusb not installed:  pip install pyusb")
         self._usb = usb.core.find(idVendor=VENDOR_ID, idProduct=PRODUCT_ID)
         if self._usb is None:
+            dongle = _detect_24g_dongle(usb.core)
+            if dongle is not None:
+                d_vid, d_pid, d_name = dongle
+                sys.exit(
+                    f"AULA S75 Pro 2.4G wireless dongle detected "
+                    f"(VID={d_vid:#06x} PID={d_pid:#06x}, {d_name!r}), "
+                    f"but wired USB keyboard (VID={VENDOR_ID:#06x} PID={PRODUCT_ID:#06x}) "
+                    "was not found.\n"
+                    "Screen/GIF uploads (0x7204 / Interface 2 bulk SPI pipe) are wired USB only — "
+                    "switch the keyboard to wired USB mode and connect the USB cable."
+                )
             sys.exit(f"Keyboard not found (VID={VENDOR_ID:#06x} PID={PRODUCT_ID:#06x}) via pyusb.\n"
                       "Check the USB cable and udev rules.")
         self._detached = []

@@ -20,11 +20,18 @@ import sys
 
 from aula_s75pro import (
     AulaS75Pro,
+    DONGLE_PRODUCT_NAME,
     EFFECTS,
+    INTERFACE_DONGLE,
     KEYMAP,
     PHYSICAL_INDICES,
+    PID_DONGLE,
+    PID_DONGLE_FALLBACK,
     REPORT_LEN,
     UNDERGLOW_MODES,
+    UnsupportedModeError,
+    VID,
+    VID_DONGLE,
 )
 
 EFFECT_NOTES = {
@@ -98,12 +105,21 @@ class _AvailableEffectsAction(argparse.Action):
 
 def cmd_info(args):
     with AulaS75Pro(mode=args.mode) as kb:
-        print(f"Connected: VID={kb.vid:04X} PID={kb.pid:04X} interface={kb.interface}")
+        print(
+            f"Connected ({kb.active_mode}): "
+            f"VID={kb.vid:04X} PID={kb.pid:04X} interface={kb.interface}"
+        )
         info = kb.read_device_info()
-    print(
-        f"Device Info (0x0504): tag={info['tag']:#06x} VID={info['vid']:04X} "
-        f"PID={info['pid']:04X} FW=v{info['fw_version']} (checksum={info['checksum']:#010x})"
-    )
+    if info.get("checksum") is None:
+        print(
+            f"Device Info (2.4G 0x02): tag={info['tag']:#06x} VID={info['vid']:04X} "
+            f"PID={info['pid']:04X} FW=v{info['fw_version']}"
+        )
+    else:
+        print(
+            f"Device Info (0x0504): tag={info['tag']:#06x} VID={info['vid']:04X} "
+            f"PID={info['pid']:04X} FW=v{info['fw_version']} (checksum={info['checksum']:#010x})"
+        )
     if args.raw:
         print(f"Raw (0x8F80): {info['raw'].hex()}")
 
@@ -111,7 +127,13 @@ def cmd_info(args):
 def cmd_battery(args):
     with AulaS75Pro(mode=args.mode) as kb:
         batt = kb.read_battery_level()
-    print(f"Battery (0xF604): {batt['level']}/5 ({batt['percent_range']})")
+    if batt.get("percent") is not None:
+        print(
+            f"Battery (2.4G 0x20): {batt['percent']}% "
+            f"(level {batt['level']}/5, {batt['percent_range']})"
+        )
+    else:
+        print(f"Battery (0xF604): {batt['level']}/5 ({batt['percent_range']})")
     if args.raw:
         print(f"Raw: {batt['raw'].hex()}")
 
@@ -180,6 +202,12 @@ def cmd_underglow(args):
     preserve = not args.no_preserve
     with AulaS75Pro(mode=args.mode) as kb:
         res = kb.set_underglow_mode(args.underglow_mode, preserve_lighting=preserve)
+    if res.get("checksum") is None:
+        print(
+            f"Underglow mode {res['mode']} ({res['mode_name']}) applied via 2.4G dongle (0x05); "
+            "flash 0x9800 untouched."
+        )
+        return
     status = "MATCH" if res["checksum_matched"] else "MISMATCH (warning issued)"
     print(
         f"Underglow mode {res['mode']} ({res['mode_name']}) applied; "
@@ -192,7 +220,7 @@ def cmd_underglow(args):
 
 
 def cmd_scan(args):
-    """List every HID device hidapi can see, and flag anything matching VID 0C45."""
+    """List every HID device hidapi can see, and flag AULA USB / 2.4G dongle nodes."""
     import hid
     devices = hid.enumerate()
     if not devices:
@@ -200,20 +228,31 @@ def cmd_scan(args):
               "issue (see README/CAPTURING.md for the udev rule), or hidapi itself "
               "isn't installed correctly.")
         return
-    found_045 = False
+    found_aula = False
     for d in devices:
         vid, pid = d["vendor_id"], d["product_id"]
+        iface = d.get("interface_number")
+        product = d.get("product_string") or ""
         marker = ""
-        if vid == 0x0C45:
-            found_045 = True
+        if vid == VID and pid == PID_DONGLE_FALLBACK:
+            found_aula = True
+            marker = f"  <-- AULA 2.4G fallback (iface {iface})"
+        elif vid == VID:
+            found_aula = True
             marker = "  <-- AULA (0C45)"
-        print(f"VID={vid:04X} PID={pid:04X} iface={d.get('interface_number')} "
+        elif vid == VID_DONGLE and pid == PID_DONGLE and product.strip() == DONGLE_PRODUCT_NAME:
+            found_aula = True
+            if iface == INTERFACE_DONGLE:
+                marker = "  <-- AULA 2.4G Dongle control (iface 3)"
+            else:
+                marker = f"  <-- AULA 2.4G Dongle ({DONGLE_PRODUCT_NAME}, iface {iface})"
+        print(f"VID={vid:04X} PID={pid:04X} iface={iface} "
               f"usage_page={d.get('usage_page')} usage={d.get('usage')} "
-              f"path={d['path']!r}{marker}")
-    if not found_045:
-        print("\nNo device with VID 0C45 was found. Either the keyboard/dongle isn't "
-              "connected, it's in a different mode than expected, or permissions are "
-              "blocking it from being visible at all (see README/CAPTURING.md).")
+              f"product={product!r} path={d['path']!r}{marker}")
+    if not found_aula:
+        print("\nNo AULA USB (0C45:800A) or 2.4G Dongle (05AC:024F '2.4G Dongle') device was found. "
+              "Either the keyboard/dongle isn't connected, it's in Bluetooth mode, or permissions "
+              "are blocking it (see README.md for udev rules).")
 
 
 def cmd_raw_send(args):
@@ -321,16 +360,20 @@ def cmd_sync_clock(args):
 
 def main():
     p = argparse.ArgumentParser(description="Aula S75Pro reverse-engineered control tool")
-    p.add_argument("--mode", choices=["usb", "dongle"], default="usb",
-                    help="connection mode (default: usb)")
+    p.add_argument(
+        "--mode",
+        choices=["auto", "usb", "dongle"],
+        default="auto",
+        help="connection mode: auto (default, prefers wired usb), usb, or dongle",
+    )
     sub = p.add_subparsers(dest="command", required=True)
 
-    sp_info = sub.add_parser("info", help="connect and query 0x0504 device/firmware info")
-    sp_info.add_argument("--raw", action="store_true", help="print raw 64-byte 0x8F80 info block")
+    sp_info = sub.add_parser("info", help="connect and query device/firmware info (0x0504 / 2.4G 0x02)")
+    sp_info.add_argument("--raw", action="store_true", help="print raw 0x8F80 info block")
     sp_info.set_defaults(func=cmd_info)
 
-    sp_batt = sub.add_parser("battery", help="query 0xF604 battery level (0-5)")
-    sp_batt.add_argument("--raw", action="store_true", help="print raw 64-byte response")
+    sp_batt = sub.add_parser("battery", help="query battery level (0-5 wired 0xF604, exact %% over 2.4G 0x20)")
+    sp_batt.add_argument("--raw", action="store_true", help="print raw response")
     sp_batt.set_defaults(func=cmd_battery)
 
     sp_read = sub.add_parser("read", help="read back lighting, settings, live RGB RAM, or custom table")
@@ -453,7 +496,11 @@ def main():
 
 
     args = p.parse_args()
-    args.func(args)
+    try:
+        args.func(args)
+    except UnsupportedModeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(2)
 
 
 if __name__ == "__main__":
