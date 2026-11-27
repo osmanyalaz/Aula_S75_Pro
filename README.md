@@ -29,98 +29,115 @@ lighting effects, per-key RGB streaming (RAM-only, ~28 fps wired; 15×6 music EQ
 - **System library (`libusb`):** Required on Linux by `pyusb` for TFT screen uploads (e.g., `libusb-1.0-0` on Debian/Ubuntu, `libusb` on Fedora/Arch)
 - **Python packages:**
 
-      pip install -r requirements.txt   # hidapi, Pillow, pyusb
+  ```bash
+  pip install -r requirements.txt   # hidapi, Pillow, pyusb
+  ```
 
 - **Optional (screen upload speedup & video support):**
 
-      pip install numpy imageio imageio-ffmpeg
+  ```bash
+  pip install numpy imageio imageio-ffmpeg
+  ```
 
 > Run commands from the repository root directory so top-level module imports (`aula_s75pro`, `keymap`, `webui`) resolve cleanly. All built-in keymaps come from `keymap.py` (`KEYMAP` / `PHYSICAL_INDICES`) with no external XML needed.
 
 ## Quick start
 
 ### CLI (`cli.py`)
-    python3 cli.py scan                          # verify USB or 2.4G Dongle visibility
-    python3 cli.py info                          # auto-detects wired USB or 2.4G Dongle
-    python3 cli.py battery                       # exact % on 2.4G, quantized level on USB
 
-    # Global lighting & underglow
-    python3 cli.py color --available-effects     # list all 20 effect IDs & options
-    python3 cli.py color 255 0 0 --effect 1      # static red (main keys)
-    python3 cli.py underglow static              # set underglow to static (color via Fn + /?)
+```bash
+python3 cli.py scan                          # verify USB or 2.4G Dongle visibility
+python3 cli.py info                          # auto-detects wired USB or 2.4G Dongle
+python3 cli.py battery                       # exact % on 2.4G, quantized level on USB
 
-    # Per-key custom table (saves to flash)
-    python3 cli.py list-keys                     # list valid key names & indices
-    python3 cli.py custom 255 80 0 --keys Esc W A S D
-    python3 cli.py custom 0 180 255 --all --brightness 4
+# Global lighting & underglow
+python3 cli.py color --available-effects     # list all 20 effect IDs & options
+python3 cli.py color 255 0 0 --effect 1      # static red (main keys)
+python3 cli.py underglow static              # set underglow to static (color via Fn + /?)
 
-    # Read back stored config / live RGB (wired USB only)
-    python3 cli.py read lighting
-    python3 cli.py read settings
-    python3 cli.py read custom-table
-    python3 cli.py read live-rgb
+# Per-key custom table (saves to flash)
+python3 cli.py list-keys                     # list valid key names & indices
+python3 cli.py custom 255 80 0 --keys Esc W A S D
+python3 cli.py custom 0 180 255 --all --brightness 4
 
-    # General settings & RTC clock sync
-    python3 cli.py set-key-response 2 --sleep 2 --fn 0
-    python3 cli.py set-sleep-time 2 --keyresponse 2 --fn 0
-    python3 cli.py sync-clock
+# Read back stored config / live RGB (wired USB only)
+python3 cli.py read lighting
+python3 cli.py read settings
+python3 cli.py read custom-table
+python3 cli.py read live-rgb
 
-    # Low-level raw HID Feature report debugging (wired USB only; use with care)
-    python3 cli.py raw-get
+# General settings & RTC clock sync
+python3 cli.py set-key-response 2 --sleep 2 --fn 0
+python3 cli.py set-sleep-time 2 --keyresponse 2 --fn 0
+python3 cli.py sync-clock
+
+# Low-level raw HID Feature report debugging (wired USB only; use with care)
+python3 cli.py raw-get
+```
 
 ### TFT Screen Uploader (`screenUpload/aula_s75pro_screen.py`)
 Wired USB only (`135×240` portrait, max `140` frames, `32–510 ms` per-frame delay):
 
-    python3 screenUpload/aula_s75pro_screen.py photo.jpg --fit
-    python3 screenUpload/aula_s75pro_screen.py anim.gif --delay 50
-    python3 screenUpload/aula_s75pro_screen.py clip.mp4 --fps 10 --max-frames 60
-    python3 screenUpload/aula_s75pro_screen.py --test-color red
-    python3 screenUpload/aula_s75pro_screen.py anim.gif --dry-run
+```bash
+python3 screenUpload/aula_s75pro_screen.py photo.jpg --fit
+python3 screenUpload/aula_s75pro_screen.py anim.gif --delay 50
+python3 screenUpload/aula_s75pro_screen.py clip.mp4 --fps 10 --max-frames 60
+python3 screenUpload/aula_s75pro_screen.py --test-color red
+python3 screenUpload/aula_s75pro_screen.py anim.gif --dry-run
+```
 
 ### Live RAM-Only Streaming (`AulaStreamer`)
 Wired USB only (~28 fps, zero flash wear):
 
-    import time
-    from aula_s75pro import AulaS75Pro
-    from aula_streamer import AulaStreamer
-    from keymap import KEYMAP
+```python
+import time
+from aula_s75pro import AulaS75Pro
+from aula_streamer import AulaStreamer
+from keymap import KEYMAP
 
-    with AulaS75Pro(mode="usb") as kb:
-        st = AulaStreamer(kb)
-        st.set_all(0, 0, 0)
-        for key in ("W", "A", "S", "D"):
-            st.set_color(KEYMAP[key], 0, 255, 128)
-        for _ in range(30):
-            st.update()
-            time.sleep(0.03)
+with AulaS75Pro(mode="usb") as kb:
+    st = AulaStreamer(kb)
+    st.set_all(0, 0, 0)
+    for key in ("W", "A", "S", "D"):
+        st.set_color(KEYMAP[key], 0, 255, 128)
+    for _ in range(30):
+        st.update()
+        time.sleep(0.03)
+```
 
 ## Linux `udev` rules (non-root access)
 Create `/etc/udev/rules.d/70-aula-s75pro.rules` (must be numbered below `73` so `TAG+="uaccess"` runs before systemd's `73-seat-late.rules`):
 
-    # AULA S75 Pro - Wired USB (HID config + PyUSB TFT screen upload)
-    SUBSYSTEM=="usb", ATTR{idVendor}=="0c45", ATTR{idProduct}=="800a", TAG+="uaccess"
-    SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0c45", ATTRS{idProduct}=="800a", TAG+="uaccess"
+```
+# AULA S75 Pro - Wired USB (HID config + PyUSB TFT screen upload)
+SUBSYSTEM=="usb", ATTR{idVendor}=="0c45", ATTR{idProduct}=="800a", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0c45", ATTRS{idProduct}=="800a", TAG+="uaccess"
 
-    # AULA S75 Pro - 2.4GHz Dongle (scoped by product string)
-    SUBSYSTEM=="usb", ATTR{idVendor}=="05ac", ATTR{idProduct}=="024f", ATTR{product}=="2.4G Dongle", TAG+="uaccess"
-    SUBSYSTEM=="hidraw", ATTRS{idVendor}=="05ac", ATTRS{idProduct}=="024f", ATTRS{product}=="2.4G Dongle", TAG+="uaccess"
+# AULA S75 Pro - 2.4GHz Dongle (scoped by product string)
+SUBSYSTEM=="usb", ATTR{idVendor}=="05ac", ATTR{idProduct}=="024f", ATTR{product}=="2.4G Dongle", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="05ac", ATTRS{idProduct}=="024f", ATTRS{product}=="2.4G Dongle", TAG+="uaccess"
 
-    # AULA S75 Pro - 2.4GHz Dongle (fallback VID:PID from config.xml)
-    SUBSYSTEM=="usb", ATTR{idVendor}=="0c45", ATTR{idProduct}=="fefe", TAG+="uaccess"
-    SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0c45", ATTRS{idProduct}=="fefe", TAG+="uaccess"
+# AULA S75 Pro - 2.4GHz Dongle (fallback VID:PID from config.xml)
+SUBSYSTEM=="usb", ATTR{idVendor}=="0c45", ATTR{idProduct}=="fefe", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0c45", ATTRS{idProduct}=="fefe", TAG+="uaccess"
+```
 
 > **Non-systemd / headless systems:** `TAG+="uaccess"` relies on `systemd-logind` to grant ACL access to the active local seat. On systems without `systemd`/`logind` (or for headless/SSH access without a local seat), replace `TAG+="uaccess"` with `MODE="0666"`.
 
 Reload rules:
 
-    sudo udevadm control --reload && sudo udevadm trigger
+```bash
+sudo udevadm control --reload && sudo udevadm trigger
+```
 
 ## Local WebUI
 Start the zero-dependency offline WebUI (binds strictly to `127.0.0.1` and validates `Host` / `Origin` on `POST` routes):
 
-    python3 cli.py web                 # starts on http://127.0.0.1:8765 and opens browser
-    python3 cli.py web --port 9000 --no-open
-    python3 cli.py --mode dongle web   # force 2.4GHz dongle mode
+```bash
+python3 cli.py web                 # starts on http://127.0.0.1:8765 and opens browser
+python3 cli.py web --port 9000 --no-open
+python3 cli.py --mode dongle web   # force 2.4GHz dongle mode
+```
 
 Features include interactive 80-key per-key RGB painting (`keyboard-layout.json` + `keymap.py`), global lighting effects & underglow, general settings + RTC clock sync, and 135×240 portrait TFT image/GIF/video preview & wired upload. Flash/RAM read-back and TFT screen uploads require a wired USB connection.
 
@@ -130,7 +147,9 @@ Features include interactive 80-key per-key RGB painting (`keyboard-layout.json`
 ## Testing
 Run the offline protocol and WebUI test suite (no hardware required):
 
-    python3 -m unittest discover -s tests -v
+```bash
+python3 -m unittest discover -s tests -v
+```
 
 ## Docs
 See [PROTOCOL.md](PROTOCOL.md) for the full reverse-engineered protocol, and [FIRMWARE_AUDIT.md](FIRMWARE_AUDIT.md) for firmware verification details and safety exclusions.
@@ -152,5 +171,5 @@ See [PROTOCOL.md](PROTOCOL.md) for the full reverse-engineered protocol, and [FI
   - *(On-board-only hardware controls in firmware `v1.03`: rotary encoder CW/CCW/press `0x00E9`/`0x00EA`/`0x00E2`, TFT screen language `0x2000023A` toggled on the keyboard LCD menu — `DeviceDriver.exe`'s Settings language dropdown only sets its own PC GUI `LCID`, OS layout mode `Fn+Q/W/E/R`, Row-5 accent bar `Fn+Z`, underglow static/breathing color `Fn+/?`, and full `Fn+Esc` factory reset have no USB/2.4G setter; `0x3804` full SPI flash write, the EP0 ISP bootloader magic sequence, and wireless `0x7F` / `0x80–0x8F` SPI streaming remain intentionally excluded for safety.)*
 
 ## Credits & License
-Reverse-engineered from USB captures of the official driver, its decompilation, and the keyboard MCU firmware. Built with AI assistance for Ghidra analysis, implementation, and code auditing, with all active features verified on live S75 Pro hardware (firmware v1.03).
+Reverse-engineered from USB captures of the official driver, its decompilation, and the keyboard MCU firmware.
 Licensed under the MIT License — see [LICENSE.md](LICENSE.md).
