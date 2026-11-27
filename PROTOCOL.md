@@ -164,7 +164,7 @@ Quirks:
 
 All LEDs share the single RGB RAM arrays (`0x20001838` R, `0x2000195E` G, `0x20001A84` B, clocked out by IRQ19 `FUN_0000648c`), split into **3 independent logical zones**:
 
-1. **Main Keys (82 physical keys):** Controlled by `0x1304` (`0x00–0x13`, `0x80`), `0x2304`, `0x2004`, and `Fn` main-lighting hotkeys.
+1. **Main Keys (80 addressable RGB keys in `rgb-keyboard.xml` / `keymap.py`; 82 matrix positions):** Controlled by `0x1304` (`0x00–0x13`, `0x80`), `0x2304`, `0x2004`, and `Fn` main-lighting hotkeys.
 2. **Row-6 Side / Underglow (14 LEDs, indices `0x7E–0x8B`):** Runtime struct at `0x20000194`, rendered by `FUN_0000e1fc` (`0x0000E0B8–0x0000E440`). Controlled via **`Fn + Right Shift`** (cycle mode `0..4`), **`Fn + /?`** (cycle preset color), and **USB `0x1304` `payload[0] = 0x20 + mode`** (`0`=flowing, `1`=spectrum, `2`=static, `3`=breathing, `4`=off). `FUN_00003f42` (`0x00003F82`) reads **only `payload[0]`** (RGB/brightness/speed bytes in `payload[1..63]` are ignored for `0x20–0x24`, so **unlike `0x00–0x13` / `cli.py color`, `static` (`0x22`) cannot set an RGB color over USB** — use **`Fn + /?`** on the keyboard). Hardware-verified (`--mode 4` / `--mode 0`).
 3. **Row-5 Accent Bar (5 LEDs, indices `0x6C, 0x6D, 0x6E, 0x70, 0x71`, Home/End strip):** Runtime state at `0x200001DC`. Controlled **only by `Fn + Z`** — **no USB HID command exists** in `s75pro_fw_v1.03.bin`.
 
@@ -264,7 +264,7 @@ to ensure the MCU animation pointers and flash buffers latch cleanly:
        each = 16 x [light_index, R, G, B]
        chunk 9 ends with AA 55 trailer at bytes 62-63
 9. SET 04 02 ...                       (commit / 0x0204)
-10. wait ~35 ms, then GET_REPORT       (commit ACK: status 0x01 + 16-bit table checksum)
+10. wait ~35 ms, then GET_REPORT       (commit ACK: status 0x01 + 32-bit LE table checksum in resp[4..7])
 11. wait ~35 ms, then SET 04 f0 ...    (finalize / 0xF004)
 ```
 
@@ -312,6 +312,7 @@ to ensure the MCU animation pointers and flash buffers latch cleanly:
 - **Upload handshake:** `04 18` (open) → `04 72 <mode> ... <chunks_le16 at 8..9>` (probe; `0x000045D4` ignores `buf[2]`, always sets external SPI base = `0x00750000`, and determines still vs. animated solely from `N_frames` at `0x750000`) → `chunks` × 4096 B packets on `EP 0x03 OUT` (each ACKed by `01 5A 02 ...` on `EP 0x84 IN`) → `04 02` commit.
 - **Delay unit = `2 ms` per tick (clock-tree proven):** `FUN_00013bfa` (PLL = 48 MHz) → `FUN_00006f8c` (SysTick `RVR = 23999` → 0.5 ms) → `FUN_000008e2` (`pbVar2[2] = 2 ms`) → `FUN_00011a84` (GIF hold scheduler). Valid wire range is **`0x10–0xFF` (`32–510 ms`)**; `FUN_00011a84` silently replaces any value `< 0x10` with `0x19` (`50 ms`).
 - **Hard frame limit = `140` frames (`0x00FF7000 <= 0x01000000`):** SPI flash drivers (`FUN_00007858` / `FUN_000078be` / `FUN_00007964`) send 24-bit addresses (`16 MB` ceiling `0x01000000`). From upload base `0x00750000`, `140` frames (`256 + 140 × 64,800` B → `2,215` 4 KB chunks = `0x008A7000`) ends at `0x00FF7000 <= 0x01000000`, whereas `141` frames (`2,231` chunks = `0x008B7000`, matching `rgb-keyboard.xml` `gif_maxframes="141"`) wraps 28 KB past 16 MB (`0x01007000`) back onto factory TFT assets at `0x00000000`. (Secondary RAM limit: `FUN_00010460(0x750000)` copies `0xC0 = 192` bytes into RAM `0x200021DA` for `N_frames` + `191` delay slots before fuel-gauge RAM at `0x200022A0+`.) Flash pixel data still starts at `0x00750100` (256-byte flash preamble, stride `64,800` bytes).
+- **Linux PyUSB handoff & state cleanup:** Because `Interface 2` bulk writes require PyUSB raw endpoints, `screenUpload/aula_s75pro_screen.py` detaches the kernel driver from Interface 3 + Interface 2 (`EP 0x03`/`0x84`), releases managed interfaces, and re-attaches the kernel driver in `finally`. On normal upload completion it sends `0x0204` followed by `GET_REPORT` (`0x00003E94–0x00003EA8`) so State 3 clears cleanly back to State 0; on mid-State-5 failure it skips `0x0204` (which State 5 ignores and which resets the watchdog) and waits `2.1 s` for the `2.0 s` `FUN_0000466a` idle watchdog before re-attaching `hidraw`. The WebUI polls for `hidraw` rebind under `hw_lock` after both successful and failed uploads.
 
 ## 8. Hard-won discoveries (read before modifying the code)
 

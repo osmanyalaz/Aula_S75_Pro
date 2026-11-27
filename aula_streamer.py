@@ -16,6 +16,9 @@ Protocol notes (verified):
 
 import time
 
+from aula_s75pro import McuRejectedError
+from keymap import KEYMAP
+
 
 class StreamFault(IOError):
     """A frame could not be fully delivered. The next update() retries
@@ -25,7 +28,7 @@ class StreamFault(IOError):
 class AulaStreamer:
     CHUNKS = 8                 # header's payload[8] advertises 8 chunks
     KEYS_PER_CHUNK = 16        # 64-byte payload / 4 bytes per key
-    MAX_KEYS = CHUNKS * KEYS_PER_CHUNK   # 128 slots; S75Pro uses ~104
+    MAX_KEYS = CHUNKS * KEYS_PER_CHUNK   # 128 slots; S75Pro uses 80 physical keys
 
     _CMD_STREAM = b"\x04\x20"   # 0x2004 - dynamic RGB frame header
     _CMD_COMMIT = b"\x04\x02"   # 0x0204 - commit / latch
@@ -37,9 +40,11 @@ class AulaStreamer:
     DEFAULT_GET_DELAY = 0.010
     DEFAULT_CHUNK_DELAY = 0.002
 
-    def __init__(self, kb, keymap, get_delay=DEFAULT_GET_DELAY, chunk_delay=DEFAULT_CHUNK_DELAY):
+    def __init__(self, kb, keymap=None, get_delay=DEFAULT_GET_DELAY, chunk_delay=DEFAULT_CHUNK_DELAY):
 
         self.kb = kb
+        if keymap is None:
+            keymap = KEYMAP
 
         # MCU-side processing windows (see update()): the GET polls must not
         # arrive faster than this after the header/commit, and chunks need
@@ -82,16 +87,26 @@ class AulaStreamer:
             self._offsets[light_idx] = offset
 
 
+    @staticmethod
+    def _clamp_rgb(r, g, b):
+        return (
+            max(0, min(255, int(r))),
+            max(0, min(255, int(g))),
+            max(0, min(255, int(b))),
+        )
+
     def set_color(self, light_index, r, g, b):
-        """Set one key's colour. Out-of-range/negative indices ignored."""
+        """Set one key's colour (clamped 0..255). Out-of-range/negative indices ignored."""
         if 0 <= light_index < len(self._offsets):
             off = self._offsets[light_index]
             if off:
+                r, g, b = self._clamp_rgb(r, g, b)
                 self.buffer[off + 1] = r
                 self.buffer[off + 2] = g
                 self.buffer[off + 3] = b
 
     def set_all(self, r, g, b):
+        r, g, b = self._clamp_rgb(r, g, b)
         buf = self.buffer
         for off in self._offsets:
             if off:
@@ -114,17 +129,28 @@ class AulaStreamer:
         extra all-zero report before the commit is tolerated by the
         firmware but is NOT part of the wire sequence.
         """
+        self.kb._require_wired("AulaStreamer.update (0x2004)")
         dev = self.kb.dev
+        if dev is None:
+            raise RuntimeError("Device is not open; call open() or use a 'with' block first.")
         try:
             dev.send_feature_report(self._cached_header)
             time.sleep(self.get_delay)
-            self.kb.raw_get()
+            resp1 = self.kb.raw_get()
+            if len(resp1) >= 4 and resp1[3] == 0xFF:
+                raise McuRejectedError(
+                    f"MCU rejected 0x2004 stream header with status 0xFF. Raw: {resp1.hex()}"
+                )
             view = memoryview(self.buffer)
             for i in range(self.CHUNKS):
                 dev.send_feature_report(bytes(view[i * 65:(i + 1) * 65]))
                 time.sleep(self.chunk_delay)
             dev.send_feature_report(self._cached_commit)
             time.sleep(self.get_delay)
-            self.kb.raw_get()
-        except IOError as e:
+            resp2 = self.kb.raw_get()
+            if len(resp2) >= 4 and resp2[3] == 0xFF:
+                raise McuRejectedError(
+                    f"MCU rejected 0x2004 stream commit with status 0xFF. Raw: {resp2.hex()}"
+                )
+        except (IOError, OSError) as e:
             raise StreamFault(f"frame delivery failed ({e})") from e

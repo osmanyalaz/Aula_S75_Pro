@@ -13,7 +13,6 @@
     isPainting: false,
     loadedWiredDefaults: false,
     selectedFile: null,
-    lastPreviewUrl: null,
     toastTimer: null,
   };
 
@@ -353,20 +352,24 @@
     $("screen-dongle-banner").classList.toggle("hidden", !showDongleScreenWarn);
   }
 
+  function applyLightingToForm(lit) {
+    $("light-effect").value = String(lit.effect);
+    updateEffectNote();
+    const hex = rgbToHex(lit.rgb[0], lit.rgb[1], lit.rgb[2]);
+    $("light-color-picker").value = hex;
+    $("light-color-hex").value = hex;
+    $("light-option").value = String(lit.option ? 1 : 0);
+    $("light-brightness").value = String(Math.min(5, lit.brightness));
+    $("light-speed").value = String(Math.min(5, lit.speed));
+    $("light-direction").value = String(Math.min(2, lit.direction));
+    syncLightingLabels();
+  }
+
   async function preloadWiredDefaults() {
     try {
       const lit = await apiJson("/api/lighting");
       if (!lit.erased && !lit.zeroed && lit.effect <= 19) {
-        $("light-effect").value = String(lit.effect);
-        updateEffectNote();
-        const hex = rgbToHex(lit.rgb[0], lit.rgb[1], lit.rgb[2]);
-        $("light-color-picker").value = hex;
-        $("light-color-hex").value = hex;
-        $("light-option").value = String(lit.option ? 1 : 0);
-        $("light-brightness").value = String(Math.min(5, lit.brightness));
-        $("light-speed").value = String(Math.min(5, lit.speed));
-        $("light-direction").value = String(Math.min(2, lit.direction));
-        syncLightingLabels();
+        applyLightingToForm(lit);
       }
     } catch (_) {
       /* ignore non-fatal preload error */
@@ -522,8 +525,15 @@
 
     $("btn-load-lighting").addEventListener("click", async () => {
       try {
-        await preloadWiredDefaults();
-        showToast("Loaded wired flash lighting & settings", "ok");
+        const lit = await apiJson("/api/lighting");
+        if (!lit.erased && !lit.zeroed && lit.effect <= 19) {
+          applyLightingToForm(lit);
+          showToast("Loaded lighting config from flash 0x9800", "ok");
+        } else if (!lit.erased && !lit.zeroed && lit.effect === 0x80) {
+          showToast("Keyboard is in custom per-key RGB mode (0x80)", "info");
+        } else {
+          showToast("Lighting config page (0x9800) is currently erased/empty", "info");
+        }
       } catch (err) {
         showToast(err.message, "error");
       }

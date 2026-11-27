@@ -18,13 +18,12 @@ lighting effects, per-key RGB streaming (RAM-only, ~28 fps wired; 15×6 music EQ
 - Device info (`cli.py info`), battery level (`cli.py battery` — tier `0–5` wired, exact `%` over 2.4G), wired flash/live-RAM read-back (`cli.py read ...`), and keyboard RTC sync
 
 ## Quick start
-    pip install -r requirements.txt   # hidapi
+    pip install -r requirements.txt   # hidapi, Pillow, pyusb
     python cli.py scan                # verify USB or 2.4G Dongle visibility
     python cli.py info                # auto-detects wired USB or 2.4G Dongle
     python cli.py battery             # exact % on 2.4G, quantized level on USB
     python cli.py color 255 0 0 --effect 1      # static red (main keys)
     python cli.py underglow static              # set underglow to static (color via Fn + /?)
-    python test.py                               # WASD blink (wired streaming demo)
 
 ## Linux `udev` rules (non-root access)
 Create `/etc/udev/rules.d/70-aula-s75pro.rules` (must be numbered below `73` so `TAG+="uaccess"` runs before systemd's `73-seat-late.rules`):
@@ -56,16 +55,17 @@ Start the zero-dependency offline WebUI (binds strictly to `127.0.0.1`):
 
 Features include interactive 80-key per-key RGB painting (`keyboard-layout.json` + `keymap.py`), global lighting effects & underglow, general settings + RTC clock sync, and 135×240 portrait TFT image/GIF/video preview & wired upload. Flash/RAM read-back and TFT screen uploads require a wired USB connection.
 
+- **HTTP routes:** `GET /` (plus `/static/...`), `GET /api/meta`, `GET /api/status`, `GET /api/lighting`, `GET /api/custom-table`, `GET /api/settings`, and `POST` handlers for `/api/lighting`, `/api/underglow`, `/api/custom-table`, `/api/settings`, `/api/sync-clock`, `/api/screen/preview`, and `/api/screen/upload`.
+- **PyUSB / `hidraw` handoff on TFT uploads:** `POST /api/screen/upload` (and `screenUpload/aula_s75pro_screen.py`) temporarily detaches Linux kernel `usbhid` drivers on Interface 3 and Interface 2, completes the State-3 `0x0204` + `GET_REPORT` commit (or waits `2.1 s` past the `2.0 s` MCU watchdog on mid-transfer abort), releases and re-attaches the kernel drivers, and polls up to `2.5 s` under `hw_lock` for `hidraw`/`udevd` rebind before subsequent `hidapi` operations run.
+
 ## Docs
 See [PROTOCOL.md](PROTOCOL.md) for the full reverse-engineered protocol, and [FIRMWARE_AUDIT.md](FIRMWARE_AUDIT.md) for firmware verification details and safety exclusions.
 
 ## TO-DO
 - **`aula_streamer.py` polish:**
-  - Clamp RGB values (`0..255`) in `set_color()` and `set_all()`.
-  - Keep `keymap` in `AulaStreamer` and add a `set_key(name, r, g, b)` helper.
+  - Add a `set_key(name, r, g, b)` helper (using `keymap.KEYMAP`).
   - Add a context manager / `stop()` cleanup to reload the saved hardware lighting (`0x1304` `0x00`) on exit instead of leaving the last frame frozen.
-  - Guard against an unopened `kb.dev` handle and check `raw_get()` replies for `0xFF` rejections.
-  - Expose a streaming subcommand in `cli.py` (and clean up legacy relative paths / unclosed handles in `test.py` and `test2.py`).
+  - Expose a streaming subcommand in `cli.py`.
 - **Streaming plugins (`0x2004`):**
   - Audio visualizer
   - System temperature / CPU-load monitor
@@ -73,7 +73,7 @@ See [PROTOCOL.md](PROTOCOL.md) for the full reverse-engineered protocol, and [FI
 - **Remaining protocol features (low priority / optional):**
   - Macros and keymap remapping (`0x1104` / `0x2704`)
   - Factory reset and TFT/keyboard language selection
-  - *(Note: `0x3804` full SPI flash write and the EP0 ISP bootloader magic sequence remain intentionally excluded for safety.)*
+  - *(Note: `0x3804` full SPI flash write, the EP0 ISP bootloader magic sequence, and wireless 2.4G OTA opcodes `0x7F` / `0x80–0x8F` remain intentionally excluded for safety.)*
 
 ## Credits
 Reverse-engineered from USB captures of the official driver, its decompilation,

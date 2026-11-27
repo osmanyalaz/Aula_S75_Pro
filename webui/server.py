@@ -942,12 +942,19 @@ class AulaRequestHandler(BaseHTTPRequestHandler):
         with self.server.hw_lock:
             try:
                 backend = screen_mod.make_backend()
-                backend.open()
+                opened = False
                 try:
+                    backend.open()
+                    opened = True
                     screen_mod.upload(backend, frames, delays_ticks, verbose=False)
                 finally:
+                    had_usb_session = opened or bool(getattr(backend, "_detached", None))
                     backend.close()
-                hid_reattached = self._wait_for_hid_reattach()
+                    if had_usb_session:
+                        try:
+                            hid_reattached = self._wait_for_hid_reattach()
+                        except Exception:
+                            hid_reattached = False
             except SystemExit as exc:
                 msg = str(exc) or "Screen backend aborted"
                 low = msg.lower()

@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import io
 import re
 import struct
 import sys
 import tempfile
+import types
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -20,6 +23,7 @@ for path in (str(BASE_DIR), str(SCREEN_DIR)):
         sys.path.insert(0, path)
 
 import aula_s75pro as lib  # noqa: E402
+import aula_streamer  # noqa: E402
 import cli  # noqa: E402
 import aula_s75pro_screen as screen  # noqa: E402
 
@@ -49,10 +53,16 @@ class MockS75ProDevice:
         self.is_live_ram_read = False
         self.trailing_flash_byte = trailing_flash_byte
 
-        # State 2 write tracking
+        # State 2 write / streaming tracking
         self.write_target: int | None = None
         self.write_expected = 0
         self.write_received: list[bytes] = []
+        self.stream_active = False
+        self.streaming_chunks: list[bytes] = []
+        self.streamed_frames: list[list[bytes]] = []
+
+        # State 6 RTC write tracking
+        self.rtc_time: bytes | None = None
 
         # Simulated MCU flash pages & RAM
         info = bytearray([0xFF] * 64)
@@ -139,6 +149,15 @@ class MockS75ProDevice:
             self.write_expected = chunks
             self.write_target = {0x13: 0x9800, 0x17: 0x9000, 0x23: 0x9C00}[op]
             self.state = 2
+        elif op == 0x20:
+            self.usb_flags &= ~0x02
+            self.stream_active = True
+            self.streaming_chunks = []
+            self.write_expected = chunks
+            self.state = 2
+        elif op == 0x28:
+            self.usb_flags &= ~0x02
+            self.state = 6
         else:
             # 0x18, 0x19, 0xF0, 0xF6 stay State 0 and leave bit 1 as set
             self.state = 0
@@ -160,7 +179,7 @@ class MockS75ProDevice:
                 self.buf[3] = 0xFF
                 self.hid_ctx5 = 0
                 return
-            valid_ops = {0x05, 0x12, 0x13, 0x16, 0x17, 0x18, 0x19, 0x22, 0x23, 0xF0, 0xF5, 0xF6}
+            valid_ops = {0x05, 0x12, 0x13, 0x16, 0x17, 0x18, 0x19, 0x20, 0x22, 0x23, 0x28, 0xF0, 0xF5, 0xF6}
             if op not in valid_ops:
                 self.buf[3] = 0xFF
                 self.hid_ctx5 = 0
@@ -188,6 +207,13 @@ class MockS75ProDevice:
             return
 
         if self.state == 2:
+            if self.stream_active:
+                self.streaming_chunks.append(payload)
+                if len(self.streaming_chunks) >= self.write_expected:
+                    self.streamed_frames.append(list(self.streaming_chunks))
+                    self.stream_active = False
+                    self.state = 3
+                return
             self.write_received.append(payload)
             if self.write_target == 0x9800 and (payload[0] >> 4) == 2:
                 # 0x20..0x24 underglow skips writing flash 0x9800 (stays erased 0xFF)
@@ -223,6 +249,16 @@ class MockS75ProDevice:
             self.override_commit_checksum = None
             struct.pack_into("<I", self.buf, 4, chk & 0xFFFFFFFF)
             self.hid_ctx5 |= 0x10
+            return
+
+        if self.state == 6:
+            if payload[2] != 0x5A:
+                self.buf[3] = 0xFF
+                return
+            self.rtc_time = payload[3:9]
+            self.checksum = 0
+            self.state = 3
+            return
 
     def get_feature_report(self, report_id: int, length: int) -> bytes:
         assert report_id == 0 and length == 65
@@ -390,8 +426,10 @@ class SafetyAndConstantsTests(unittest.TestCase):
     def test_no_dangerous_opcodes_or_bootloader_magic_in_python_sources(self):
         py_files = [
             BASE_DIR / "aula_s75pro.py",
+            BASE_DIR / "aula_streamer.py",
             BASE_DIR / "cli.py",
             SCREEN_DIR / "aula_s75pro_screen.py",
+            BASE_DIR / "webui" / "server.py",
         ]
         # Construct forbidden signatures dynamically so they do not literally match source scans elsewhere
         bad_opcode_hex = "3804"
@@ -403,6 +441,42 @@ class SafetyAndConstantsTests(unittest.TestCase):
             self.assertNotIn(f"0x{bad_opcode_hex}", raw_text, f"{src_path.name} references excluded opcode")
             self.assertNotIn(bad_wire, compact_hex, f"{src_path.name} contains excluded SPI prefix bytes")
             self.assertNotIn(bad_isp, compact_hex, f"{src_path.name} contains ISP bootloader magic")
+
+        # Ensure no 2.4G command constant uses wireless OTA/bootloader opcodes 0x7F or 0x80..0x8F
+        dongle_cmds = {
+            name: val
+            for name, val in vars(lib).items()
+            if name.startswith("DONGLE_CMD_") and isinstance(val, int)
+        }
+        self.assertTrue(dongle_cmds)
+        for name, val in dongle_cmds.items():
+            self.assertNotEqual(val, 0x7F, f"{name} must not use wireless OTA opcode 0x7F")
+            self.assertFalse(0x80 <= val <= 0x8F, f"{name} must not use wireless OTA opcode 0x{val:02X}")
+
+    def test_udev_error_messages_have_no_double_braces_and_use_uaccess(self):
+        kb_usb = lib.AulaS75Pro(mode="usb")
+        kb_usb.dev = mock.Mock()
+        kb_usb.dev.get_feature_report.side_effect = OSError("Access denied")
+        with self.assertRaises(IOError) as ctx_usb:
+            kb_usb.wait_until_idle()
+        msg_usb = str(ctx_usb.exception)
+        self.assertIn("/etc/udev/rules.d/70-aula-s75pro.rules", msg_usb)
+        self.assertIn('TAG+="uaccess"', msg_usb)
+        self.assertNotIn("{{", msg_usb)
+        self.assertNotIn("}}", msg_usb)
+
+        kb_dongle = lib.AulaS75Pro(mode="dongle", path=b"dongle-path")
+        fake_dev = mock.Mock()
+        fake_dev.read.return_value = b""
+        fake_dev.write.side_effect = OSError("Access denied")
+        with mock.patch.object(lib.hid, "device", return_value=fake_dev):
+            with self.assertRaises(IOError) as ctx_dongle:
+                kb_dongle.open()
+        msg_dongle = str(ctx_dongle.exception)
+        self.assertIn("/etc/udev/rules.d/70-aula-s75pro.rules", msg_dongle)
+        self.assertIn('TAG+="uaccess"', msg_dongle)
+        self.assertNotIn("{{", msg_dongle)
+        self.assertNotIn("}}", msg_dongle)
 
 
 class ProtocolAndChecksumsTests(unittest.TestCase):
@@ -757,7 +831,7 @@ class ProtocolAndChecksumsTests(unittest.TestCase):
 
         # 3) Populated flash, but preserve_lighting=False skips 0x1204 and restore
         dev_np = MockS75ProDevice()
-        dev_np.flash_9800 = bytes(kb_np._build_mode_payload(effect=1, r=1, g=2, b=3)) if False else bytes([1] * 64)
+        dev_np.flash_9800 = bytes([1] * 64)
         kb_np = make_mock_kb(dev_np)
         res_np = kb_np.set_underglow_mode(3, preserve_lighting=False)
         self.assertFalse(res_np["restored_lighting"])
@@ -792,6 +866,122 @@ class ProtocolAndChecksumsTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 kb.set_underglow_mode(bad)  # type: ignore[arg-type]
             self.assertEqual(len(dev.sent_reports), count_before)
+
+    def test_sync_rtc_wired_state6_and_rejection(self):
+        dev = MockS75ProDevice()
+        kb = make_mock_kb(dev)
+        when = datetime(2026, 11, 27, 19, 5, 42)
+        ack = kb.sync_rtc(when=when)
+        self.assertEqual(ack[0:4], b"\x04\x02\x00\x01")
+        self.assertEqual(dev.rtc_time, bytes([26, 11, 27, 19, 5, 42]))
+        self.assertEqual(dev.state, 0)
+
+        dev.reject_next_cmd = 0x28
+        with self.assertRaises(lib.McuRejectedError):
+            kb.sync_rtc(when=when)
+
+    def test_find_usb_candidate_closes_device_when_active_probe_raises(self):
+        entries = [
+            {"vendor_id": 0x0C45, "product_id": 0x800A, "interface_number": None, "usage_page": 0, "path": b"if2"},
+            {"vendor_id": 0x0C45, "product_id": 0x800A, "interface_number": None, "usage_page": 0, "path": b"if3"},
+        ]
+        dev_if2 = mock.Mock()
+        dev_if2.get_feature_report.side_effect = OSError("EP0 stalled on Interface 2")
+        dev_if3 = mock.Mock()
+        dev_if3.get_feature_report.return_value = bytes(65)
+
+        with (
+            mock.patch.object(lib.hid, "enumerate", return_value=entries),
+            mock.patch.object(lib.hid, "device", side_effect=[dev_if2, dev_if3]),
+        ):
+            found = lib.AulaS75Pro._find_usb_candidate(lib.VID)
+        self.assertEqual(found, (lib.VID, lib.PID_USB, b"if3"))
+        dev_if2.close.assert_called_once()
+        dev_if3.close.assert_called_once()
+
+    def test_lighting_range_validation_and_unopened_guard(self):
+        kb = lib.AulaS75Pro(mode="usb")
+        with self.assertRaises(RuntimeError):
+            kb.raw_send(bytes(64))
+        with self.assertRaises(RuntimeError):
+            kb.raw_get()
+
+        dev = MockS75ProDevice()
+        kb_open = make_mock_kb(dev)
+        for bad_call in (
+            lambda: kb_open.set_global_lighting(20, 0, 0, 0),
+            lambda: kb_open.set_global_lighting(1, 256, 0, 0),
+            lambda: kb_open.set_global_lighting(1, -1, 0, 0),
+            lambda: kb_open.set_global_lighting(1, 0, 0, 0, brightness=6),
+            lambda: kb_open.set_global_lighting(1, 0, 0, 0, speed=6),
+            lambda: kb_open.set_global_lighting(1, 0, 0, 0, direction=3),
+            lambda: kb_open.set_global_lighting(1, 0, 0, 0, option=2),
+            lambda: kb_open.set_global_lighting(True, 0, 0, 0),  # type: ignore[arg-type]
+            lambda: kb_open.set_custom_lighting({1: (255, 0, 0)}, brightness=6),
+            lambda: kb_open.set_custom_lighting({1: (True, 0, 0)}),  # type: ignore[dict-item]
+            lambda: kb_open.set_custom_lighting({1: (0, 256, 0)}),
+        ):
+            with self.assertRaises(ValueError):
+                bad_call()
+        # _build_mode_payload still allows internal custom-mode 0x80
+        self.assertEqual(kb_open._build_mode_payload(effect=0x80, brightness=3)[0], 0x80)
+
+
+class AulaStreamerTests(unittest.TestCase):
+    def setUp(self):
+        self.sleep_patcher = mock.patch("time.sleep", return_value=None)
+        self.sleep_patcher.start()
+
+    def tearDown(self):
+        self.sleep_patcher.stop()
+
+    def test_default_keymap_clamping_and_full_frame_delivery(self):
+        dev = MockS75ProDevice()
+        kb = make_mock_kb(dev)
+        st = aula_streamer.AulaStreamer(kb)
+        esc_idx = lib.KEYMAP["Esc"]
+
+        st.set_all(-10, 300, 128)
+        st.set_color(esc_idx, 999, -5, 42)
+        st.update()
+
+        self.assertEqual(len(dev.streamed_frames), 1)
+        chunks = dev.streamed_frames[0]
+        self.assertEqual(len(chunks), 8)
+        # Esc is slot 0 in KEYMAP (chunk 0, offset 0..3)
+        self.assertEqual(chunks[0][0:4], bytes([esc_idx, 255, 0, 42]))
+        # F1 is slot 1 in KEYMAP -> clamped from (-10, 300, 128) to (0, 255, 128)
+        f1_idx = lib.KEYMAP["F1"]
+        self.assertEqual(chunks[0][4:8], bytes([f1_idx, 0, 255, 128]))
+        self.assertEqual(dev.state, 0)
+
+    def test_guards_against_dongle_unopened_rejection_and_io_fault(self):
+        dongle_dev = MockDongleDevice()
+        kb_dongle = make_mock_dongle_kb(dongle_dev)
+        st_dongle = aula_streamer.AulaStreamer(kb_dongle)
+        with self.assertRaises(lib.UnsupportedModeError):
+            st_dongle.update()
+        # Verify no feature report ever reached the dongle mock
+        self.assertEqual(dongle_dev.written_packets, [])
+
+        kb_unopened = lib.AulaS75Pro(mode="usb")
+        st_unopened = aula_streamer.AulaStreamer(kb_unopened)
+        with self.assertRaises(RuntimeError):
+            st_unopened.update()
+
+        dev_rej = MockS75ProDevice()
+        dev_rej.reject_next_cmd = 0x20
+        kb_rej = make_mock_kb(dev_rej)
+        st_rej = aula_streamer.AulaStreamer(kb_rej)
+        with self.assertRaises(lib.McuRejectedError):
+            st_rej.update()
+
+        kb_io = lib.AulaS75Pro(mode="usb")
+        kb_io.dev = mock.Mock()
+        kb_io.dev.send_feature_report.side_effect = OSError("USB disconnect")
+        st_io = aula_streamer.AulaStreamer(kb_io)
+        with self.assertRaises(aula_streamer.StreamFault):
+            st_io.update()
 
 
 class ScreenUploaderTests(unittest.TestCase):
@@ -878,8 +1068,6 @@ class ScreenUploaderTests(unittest.TestCase):
         self.assertIn("140-frame device limit", out.getvalue())
 
     def test_extract_video_frames_vfr_dedup_and_delay_splitting(self):
-        import types
-        from unittest import mock
         import numpy as np
 
         def make_raw(r: int, g: int, b: int):
@@ -947,8 +1135,6 @@ class ScreenUploaderTests(unittest.TestCase):
                 self.assertIn("140-frame device limit", out.getvalue())
 
     def test_pyusb_backend_reports_wired_only_when_24g_dongle_connected(self):
-        import types
-
         dongle_usb_dev = types.SimpleNamespace(product="2.4G Dongle")
         apple_usb_dev = types.SimpleNamespace(product="Apple Keyboard")
 
@@ -980,7 +1166,6 @@ class ScreenUploaderTests(unittest.TestCase):
         self.assertIn("Keyboard not found", str(ctx2.exception))
 
     def test_pyusb_backend_close_releases_interfaces_before_reattach_and_disposes(self):
-        import types
         import warnings
 
         events = []
@@ -1042,6 +1227,119 @@ class ScreenUploaderTests(unittest.TestCase):
         self.assertEqual([events[i] for i in attach_indices], [("attach", 2), ("attach", 3)])
         self.assertLess(max(release_indices), min(attach_indices))
         self.assertLess(max(attach_indices), dispose_idx)
+
+    def test_upload_state3_commit_state5_watchdog_and_cmd_upload_rejection(self):
+        frame = screen.solid_rgb565(255, 0, 0)
+
+        class FakeUploadBackend:
+            def __init__(self, *, reject_upload=False, fail_chunk_idx=None):
+                self.reject_upload = reject_upload
+                self.fail_chunk_idx = fail_chunk_idx
+                self.ctrl_sets = []
+                self.ctrl_gets = 0
+                self.chunks_written = 0
+                self.last_cmd = b""
+
+            def ctrl_set(self, data):
+                self.last_cmd = bytes(data)
+                self.ctrl_sets.append(bytes(data[:2]))
+
+            def ctrl_get(self):
+                self.ctrl_gets += 1
+                op = self.last_cmd[1] if len(self.last_cmd) >= 2 else 0
+                if self.reject_upload and op == 0x72:
+                    return bytes([0x04, 0x72, 0x00, 0xFF]) + bytes(60)
+                return bytes([0x04, op, 0x00, 0x01]) + bytes(60)
+
+            def write_chunk(self, chunk):
+                if self.fail_chunk_idx is not None and self.chunks_written == self.fail_chunk_idx:
+                    raise IOError("Bulk OUT failed")
+                self.chunks_written += 1
+                return b"\x01\x5a\x02" + bytes(61)
+
+        # 1) Normal upload completes State-3 commit with ctrl_set(CMD_END) + ctrl_get()
+        b_ok = FakeUploadBackend()
+        sleeps_ok = []
+        with mock.patch("time.sleep", side_effect=lambda s: sleeps_ok.append(s)):
+            screen.upload(b_ok, [frame], [screen.DEFAULT_STILL_DELAY], verbose=False)
+        self.assertEqual(b_ok.chunks_written, screen.total_chunks_needed(1))
+        self.assertEqual(b_ok.ctrl_sets[-1], b"\x04\x02")
+        self.assertGreaterEqual(b_ok.ctrl_gets, 4)
+
+        # 2) Mid-State-5 failure waits >= 2.0 s watchdog WITHOUT sending CMD_END in finally
+        b_mid = FakeUploadBackend(fail_chunk_idx=2)
+        sleeps_mid = []
+        with mock.patch("time.sleep", side_effect=lambda s: sleeps_mid.append(s)):
+            with self.assertRaises(IOError):
+                screen.upload(b_mid, [frame], [screen.DEFAULT_STILL_DELAY], verbose=False)
+        # Only pre-flight CMD_END before entering State 5; never after chunk failure
+        self.assertEqual(b_mid.ctrl_sets, [b"\x04\x02", b"\x04\x18", b"\x04\x72"])
+        self.assertGreaterEqual(sleeps_mid[-1], 2.0)
+
+        # 3) 0xFF rejection on cmd_upload aborts before sending any chunks
+        b_rej = FakeUploadBackend(reject_upload=True)
+        with mock.patch("time.sleep", return_value=None):
+            with self.assertRaises(IOError) as ctx_rej:
+                screen.upload(b_rej, [frame], [screen.DEFAULT_STILL_DELAY], verbose=False)
+        self.assertIn("0xFF", str(ctx_rej.exception))
+        self.assertEqual(b_rej.chunks_written, 0)
+
+    def test_pyusb_partial_detach_failure_reattaches_already_detached_interface(self):
+        events = []
+        ep_out = types.SimpleNamespace(bEndpointAddress=screen.EP_OUT)
+        ep_in = types.SimpleNamespace(bEndpointAddress=screen.EP_IN)
+        intf2 = [ep_out, ep_in]
+        # Give interfaces bInterfaceNumber attributes while keeping iterable endpoints
+        class FakeInterface(list):
+            def __init__(self, num, eps):
+                super().__init__(eps)
+                self.bInterfaceNumber = num
+
+        cfg = [FakeInterface(2, [ep_out, ep_in]), FakeInterface(3, [])]
+
+        class PartialFailUsbDev:
+            def __init__(self):
+                self._ctx = types.SimpleNamespace(managed_interfaces=set())
+
+            def get_active_configuration(self):
+                return cfg
+
+            def is_kernel_driver_active(self, iface):
+                return True
+
+            def detach_kernel_driver(self, iface):
+                events.append(("detach", iface))
+                if iface == 3:
+                    raise OSError(errno.EACCES, "Access denied on interface 3")
+
+            def attach_kernel_driver(self, iface):
+                events.append(("attach", iface))
+
+        fake_dev = PartialFailUsbDev()
+        fake_usb_util = types.SimpleNamespace(
+            release_interface=lambda dev, iface: events.append(("release", iface)),
+            dispose_resources=lambda dev: events.append(("dispose", None)),
+        )
+        fake_usb_core = types.SimpleNamespace(
+            find=lambda idVendor=None, idProduct=None: fake_dev
+        )
+        fake_usb_pkg = types.SimpleNamespace(core=fake_usb_core, util=fake_usb_util)
+
+        with mock.patch.dict(
+            sys.modules,
+            {"usb": fake_usb_pkg, "usb.core": fake_usb_core, "usb.util": fake_usb_util},
+        ):
+            backend = screen.PyUsbBackend()
+            try:
+                with self.assertRaises(OSError):
+                    backend.open()
+                self.assertEqual(backend._detached, [2])
+            finally:
+                backend.close()
+
+        self.assertIn(("attach", 2), events)
+        self.assertNotIn(("attach", 3), events)
+        self.assertEqual(backend._detached, [])
 
 
 class DongleProtocolTests(unittest.TestCase):
@@ -1327,6 +1625,25 @@ class CliMockTests(unittest.TestCase):
         with self.assertRaises(SystemExit) as ctx:
             run_dongle(["--mode", "dongle", "read", "lighting"])
         self.assertEqual(ctx.exception.code, 2)
+
+        # Out-of-range CLI arguments rejected by argparse before touching hardware
+        for bad_argv in (
+            ["color", "256", "0", "0"],
+            ["color", "0", "0", "0", "--brightness", "6"],
+            ["color", "0", "0", "0", "--speed", "6"],
+            ["color", "0", "0", "0", "--dir", "3"],
+            ["color", "0", "0", "0", "--opt", "2"],
+            ["custom", "0", "0", "-1", "--all"],
+            ["set-key-response", "6"],
+            ["set-sleep-time", "4"],
+        ):
+            with (
+                mock.patch.object(sys, "argv", ["cli.py"] + bad_argv),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                with self.assertRaises(SystemExit) as bad_ctx:
+                    cli.main()
+                self.assertEqual(bad_ctx.exception.code, 2)
 
         scan_entries = [
             {"vendor_id": 0x05AC, "product_id": 0x024F, "interface_number": 3, "usage_page": 0, "usage": 0, "product_string": "2.4G Dongle", "path": b"d3"},

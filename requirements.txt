@@ -1,1 +1,7 @@
 hidapi>=0.14.0
+Pillow>=10.0.0
+pyusb>=1.2.1
+# Optional (faster image conversion & video upload support):
+# numpy>=1.26.0
+# imageio>=2.34.0
+# imageio-ffmpeg>=0.4.9

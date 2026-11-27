@@ -23,6 +23,7 @@ Reverse-engineered from USB/HID traffic captures (usbmon + Wireshark).
 │    EP 0x03  write(4096 bytes)  → image chunk                            │
 │    EP 0x84  read (64 bytes)    ← ack  01 5A 02 00…                      │
 │  EP0  SET_REPORT [Feature] → cmd_end   (04 02 00…)                      │
+│  EP0  GET_REPORT [Feature] ← ack       (clears State 3 → State 0)       │
 └─────────────────────────────────────────────────────────────────────────┘
 
 ┌─ Transfer buffer layout  (ceil((256 + N_frames × 64800) / 4096) × 4096) ┐
@@ -66,8 +67,11 @@ Requirements:
     pip install Pillow pyusb
     pip install imageio imageio-ffmpeg       # only needed for video (.mp4 etc.) input
 
-udev rule (so you can run without sudo):
-    SUBSYSTEM=="usb", ATTR{idVendor}=="0c45", ATTR{idProduct}=="800a", MODE="0666"
+udev rule (so you can run without sudo — see README.md):
+    # /etc/udev/rules.d/70-aula-s75pro.rules (below 73-seat-late.rules)
+    SUBSYSTEM=="usb", ATTR{idVendor}=="0c45", ATTR{idProduct}=="800a", TAG+="uaccess"
+    SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0c45", ATTRS{idProduct}=="800a", TAG+="uaccess"
+    # Headless / non-systemd fallback: replace TAG+="uaccess" with MODE="0666"
     # after writing: sudo udevadm control --reload && sudo udevadm trigger
 
 Usage:
@@ -82,6 +86,7 @@ Usage:
 """
 
 import argparse
+import errno
 import math
 import struct
 import sys
@@ -110,7 +115,9 @@ PIXEL_BYTES = SCREEN_W * SCREEN_H * 2  # 64 800  (135×240×2)
 # preamble bytes -> max 191 delay slots at 0x200021DA..0x20002299.)
 MAX_FRAMES = 140
 
-# HID endpoints (confirmed from captures)
+# HID / USB interfaces & endpoints (confirmed from captures & firmware v1.03):
+#   HID_IFACE = 3 : Interface 3 EP0 Feature control (SET_REPORT / GET_REPORT)
+#   EP_OUT / EP_IN: Interface 2 bulk SPI pipe (0x03 OUT 4096 B, 0x84 IN 64 B ACK)
 HID_IFACE  = 3
 EP_OUT     = 0x03
 EP_IN      = 0x84
@@ -160,8 +167,8 @@ def total_chunks_needed(n_frames: int) -> int:
     single ceil() over preamble+all-frames combined, with only ONE trailing
     padding region at the very end, not one per frame. The two formulas
     agree up to n=5 frames, then n*16 over-declares (and would over-send)
-    an increasing number of extra all-0xFF filler chunks - e.g. +45 chunks
-    (184 320 wasted bytes) at n=254. Always use this function, never
+    an increasing number of extra all-0xFF filler chunks - e.g. +25 chunks
+    (102 400 wasted bytes) at n=140. Always use this function, never
     "n_frames * 16", for both the cmd_upload chunk-count field and the
     actual buffer size - they must match what the real driver sends.
     """
@@ -305,7 +312,6 @@ def pil_to_rgb565(img, fit: bool = False) -> bytes:
         n_pixels = SCREEN_W * SCREEN_H
         out = bytearray(n_pixels * 2)
         raw_mv = memoryview(raw)           # zero-copy slice access
-        out_mv = memoryview(out).cast('H') # view as uint16 (host-endian)
         for i in range(n_pixels):
             base = i * 3
             r = raw_mv[base]
@@ -370,8 +376,6 @@ VIDEO_EXTENSIONS = {'.mp4', '.mov', '.webm', '.mkv', '.avi', '.m4v'}
 
 def _split_hold_duration(run_ms: float) -> tuple[int, int]:
     """Return ``(copies, per_copy_ticks)`` splitting holds > MAX_DELAY_MS evenly."""
-    import math
-
     copies = max(1, math.ceil((run_ms - 1e-6) / MAX_DELAY_MS))
     per_copy_ticks = ms_to_wire_delay(run_ms / copies)
     return copies, per_copy_ticks
@@ -615,34 +619,13 @@ class PyUsbBackend:
             pass
         self._detached = []
 
-    # def _detach_kernel_drivers(self) -> list:
-    #     """
-    #     Detach the kernel HID driver from all interfaces.
-    #
-    #     Why not just claim one interface:
-    #       pyusb's dev.write() resolves the owning interface internally and calls
-    #       managed_claim_interface(). If we pre-claimed via usb.util.claim_interface()
-    #       that is not tracked in _ctx.managed_interfaces, so the managed path tries
-    #       to claim it again -> EBUSY (errno 16). The fix: only detach drivers and let
-    #       pyusb handle claiming automatically on the first write/read.
-    #     """
-    #     detached = []
-    #     try:
-    #         cfg = self._usb.get_active_configuration()
-    #     except Exception:
-    #         self._usb.set_configuration()
-    #         cfg = self._usb.get_active_configuration()
-    #     for intf in cfg:
-    #         n = intf.bInterfaceNumber
-    #         try:
-    #             if self._usb.is_kernel_driver_active(n):
-    #                 self._usb.detach_kernel_driver(n)
-    #                 detached.append(n)
-    #         except Exception:
-    #             pass
-    #     return detached
-
     def _detach_kernel_drivers(self) -> list:
+        """Detach kernel HID drivers from Interface 3 and the Interface 2 bulk endpoints.
+
+        PyUSB's write()/read() resolve the owning interface and call
+        managed_claim_interface(); pre-claiming manually via claim_interface()
+        would not be tracked in _ctx.managed_interfaces and would raise EBUSY.
+        """
         try:
             cfg = self._usb.get_active_configuration()
         except Exception:
@@ -655,54 +638,75 @@ class PyUsbBackend:
                 if ep.bEndpointAddress in (EP_OUT, EP_IN):
                     needed.add(intf.bInterfaceNumber)
 
-        detached = []
+        self._detached = []
         for n in sorted(needed):
             try:
-                if self._usb.is_kernel_driver_active(n):
+                active = self._usb.is_kernel_driver_active(n)
+            except NotImplementedError:
+                continue
+            except OSError as exc:
+                if exc.errno in (errno.ENODATA, errno.ENOENT):
+                    continue
+                raise
+            if active:
+                try:
                     self._usb.detach_kernel_driver(n)
-                    detached.append(n)
-            except Exception:
-                pass
-        return detached
+                except NotImplementedError:
+                    continue
+                except OSError as exc:
+                    if exc.errno in (errno.ENODATA, errno.ENOENT):
+                        continue
+                    raise
+                self._detached.append(n)
+        return list(self._detached)
 
 def make_backend() -> PyUsbBackend:
     return PyUsbBackend()
 
 
-def upload(backend, frames_rgb565: list, delays_cs: list, verbose: bool = True):
+def upload(backend, frames_rgb565: list, delays_ticks: list, verbose: bool = True):
     """
     Full upload sequence for 1-N frames.
-    CMD_END is always sent (in finally), so firmware RGB LEDs are restored
-    even if the transfer fails or is interrupted.
+    CMD_END + GET_REPORT is executed in finally on normal completion so State 3
+    clears back to State 0; mid-State-5 aborts wait >= 2.1 s for the MCU's
+    2.0 s idle watchdog (FUN_0000466a) instead of resetting it with CMD_END.
     """
     n = len(frames_rgb565)
-    buf = build_buffer(frames_rgb565, delays_cs)
+    buf = build_buffer(frames_rgb565, delays_ticks)
     n_chunks = total_chunks_needed(n)
     chunks = [buf[i * CHUNK_SIZE : (i + 1) * CHUNK_SIZE] for i in range(n_chunks)]
 
+    entered_state5 = False
+    chunks_completed = False
     try:
-        # Pre-flight reset: send cmd_end to bring the keyboard back to idle.
+        # Pre-flight reset: send cmd_end + GET_REPORT to bring the keyboard back to idle.
         # After a large GIF transfer the board stays busy for a while, so we
         # retry with backoff instead of silently swallowing the error.
         for attempt in range(6):
             try:
                 backend.ctrl_set(CMD_END)
+                try:
+                    backend.ctrl_get()
+                except (IOError, OSError):
+                    pass
+                time.sleep(0.036)
                 break                           # board is now idle
-            except Exception:
+            except (IOError, OSError):
                 if attempt < 5:
                     time.sleep(0.3 * (attempt + 1))   # 0.3, 0.6, 0.9, 1.2, 1.5 s
 
         if verbose:
-            print(f"  -> cmd_begin")
+            print("  -> cmd_begin")
         backend.ctrl_set(CMD_BEGIN)
-        _wait_ready(backend, "cmd_begin")
+        _wait_ready(backend, "cmd_begin", expected_op=0x18)
 
         cmd_upload = make_cmd_upload(n)
         mode_str = "still" if n == 1 else f"animated, {n} frames"
         if verbose:
             print(f"  -> cmd_upload  ({mode_str}, {n_chunks} chunks)")
         backend.ctrl_set(cmd_upload)
-        _wait_ready(backend, "cmd_upload")
+        _wait_ready(backend, "cmd_upload", expected_op=0x72)
+        entered_state5 = True
 
         for i, chunk in enumerate(chunks):
             if verbose:
@@ -713,6 +717,7 @@ def upload(backend, frames_rgb565: list, delays_cs: list, verbose: bool = True):
                 print(f"  chunk {i+1:3d}/{n_chunks}  [frame {frame_idx}/{n}]          ", end='\r')
             _write_chunk_with_retry(backend, chunk, i, n_chunks)
 
+        chunks_completed = True
         if verbose:
             print(f"  all {n_chunks} chunks sent" + " " * 20)
 
@@ -721,39 +726,80 @@ def upload(backend, frames_rgb565: list, delays_cs: list, verbose: bool = True):
         time.sleep(min(0.05 * n, 2.0))
 
     finally:
-        if verbose:
-            print("\n  -> cmd_end")
-        for attempt in range(4):
-            try:
-                backend.ctrl_set(CMD_END)
-                time.sleep(1.5)
-                break
-            except Exception as e:
-                if attempt == 3:
-                    print(f"  ! cmd_end failed after retries: {e}")
-                else:
-                    time.sleep(0.4 * (attempt + 1))
+        if chunks_completed:
+            if verbose:
+                print("\n  -> cmd_end")
+            committed = False
+            for attempt in range(4):
+                try:
+                    backend.ctrl_set(CMD_END)
+                    for _ in range(20):
+                        time.sleep(0.05)
+                        try:
+                            ack = backend.ctrl_get()
+                        except (IOError, OSError):
+                            continue
+                        if len(ack) >= 4 and ack[0] == 0x04 and ack[1] == 0x02:
+                            if ack[3] == 0xFF:
+                                break
+                            if ack[3] == 0x01:
+                                time.sleep(0.1)
+                                committed = True
+                                break
+                    if committed:
+                        break
+                    if attempt < 3:
+                        time.sleep(0.4 * (attempt + 1))
+                except (IOError, OSError) as e:
+                    if attempt == 3:
+                        print(f"  ! cmd_end failed after retries: {e}")
+                    else:
+                        time.sleep(0.4 * (attempt + 1))
+            if not committed:
+                # Wait past the 2.0 s MCU idle watchdog (FUN_0000466a) before reattaching hidraw.
+                time.sleep(2.1)
+        elif entered_state5:
+            # Mid-State-5 abort: State 5 ignores CMD_END (which would only reset the
+            # 2.0 s FUN_0000466a watchdog). Wait >= 2.1 s so the MCU returns to State 0.
+            time.sleep(2.1)
 
 
-def _wait_ready(backend, step: str, retries: int = 10, delay: float = 0.02):
+def _wait_ready(
+    backend,
+    step: str,
+    expected_op: int | None = None,
+    retries: int = 20,
+    delay: float = 0.036,
+    settle: float = 0.036,
+):
     """
-    Read back after a control command until the device signals it's actually
-    ready (rather than blindly trusting whatever the first GET_REPORT returns).
-    We don't have a confirmed "ready" byte for this LCD command family the way
-    we do for the settings protocol (byte[3]==0x01 there) - this just retries
-    on read errors/empty responses as a defensive minimum. If you find the
-    real ready/busy indicator byte for these responses, tighten this check.
+    Poll GET_REPORT after a control command until the MCU accepts it (status 0x01)
+    or rejects it (status 0xFF), then pause briefly for Phase-2 state transition.
     """
     last_exc = None
+    resp = b""
     for _ in range(retries):
         try:
             resp = backend.ctrl_get()
-            return resp
-        except Exception as e:
+        except (IOError, OSError) as e:
             last_exc = e
             time.sleep(delay)
-    print(f"  ! warning: no usable response after {step} ({last_exc}); continuing anyway")
-    return b""
+            continue
+        if len(resp) >= 4 and resp[3] == 0xFF:
+            raise IOError(f"MCU rejected {step} with status 0xFF: {resp.hex()}")
+        if expected_op is None or (
+            len(resp) >= 4 and resp[0] == 0x04 and resp[1] == expected_op and resp[3] == 0x01
+        ):
+            if settle:
+                time.sleep(settle)
+            return resp
+        time.sleep(delay)
+    if last_exc is not None and not resp:
+        raise IOError(f"No usable response after {step}: {last_exc}") from last_exc
+    print(f"  ! warning: unexpected response after {step} ({resp.hex() if resp else 'none'}); continuing anyway")
+    if settle:
+        time.sleep(settle)
+    return resp
 
 
 def _write_chunk_with_retry(backend, chunk: bytes, index: int, total: int, retries: int = 3):
@@ -890,11 +936,12 @@ def main():
         return
 
     # ── Upload ────────────────────────────────────────────────────────────────
-    backend = make_backend().open()
-    print(f"Found: {backend.info()}")
-    print(f"Uploading {len(frames)} frame(s)…")
+    backend = make_backend()
     t0 = time.time()
     try:
+        backend.open()
+        print(f"Found: {backend.info()}")
+        print(f"Uploading {len(frames)} frame(s)…")
         upload(backend, frames, delays)
     finally:
         backend.close()

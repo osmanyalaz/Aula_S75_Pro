@@ -140,6 +140,13 @@ def _le16(cmd: int) -> bytes:
     return bytes([cmd & 0xFF, (cmd >> 8) & 0xFF])
 
 
+def _validate_int_range(val: int, name: str, lo: int, hi: int) -> int:
+    """Validate that val is an int (not bool) within inclusive bounds [lo, hi]."""
+    if isinstance(val, bool) or not isinstance(val, int) or not (lo <= val <= hi):
+        raise ValueError(f"{name} must be an integer in range {lo}..{hi}, got {val!r}")
+    return val
+
+
 def parse_commit_checksum(resp: bytes) -> int:
     """Decode the 32-bit little-endian byte-sum checksum from CMD_COMMIT resp[4..7]."""
     if len(resp) < 8:
@@ -326,13 +333,15 @@ class AulaS75Pro:
 
         # 3. Active probe fallback (wired USB only; interface 3 accepts 64-byte feature reports)
         for d in candidates:
+            test_dev = hid.device()
             try:
-                test_dev = hid.device()
                 test_dev.open_path(d["path"])
-                test_dev.get_feature_report(0, 65)
-                test_dev.close()
+                try:
+                    test_dev.get_feature_report(0, 65)
+                finally:
+                    test_dev.close()
                 return (vid, PID_USB, d["path"])
-            except Exception:
+            except (IOError, OSError, ValueError):
                 continue
 
         return (vid, PID_USB, candidates[0]["path"])
@@ -418,8 +427,9 @@ class AulaS75Pro:
         except (IOError, OSError) as e:
             raise IOError(
                 f"Cannot communicate with the keyboard: {e}\n"
-                "Check: USB cable, udev rule "
-                "(SUBSYSTEM==\"usb\", ATTR{{idVendor}}==\"0c45\", MODE=\"0666\"), "
+                "Check: USB cable, /etc/udev/rules.d/70-aula-s75pro.rules "
+                '(SUBSYSTEM=="usb" and SUBSYSTEM=="hidraw", ATTR/ATTRS{idVendor}=="0c45", '
+                'ATTR/ATTRS{idProduct}=="800a", TAG+="uaccess"), '
                 "and that no other process holds the device."
             ) from e
 
@@ -477,8 +487,9 @@ class AulaS75Pro:
                 self.close()
                 raise IOError(
                     f"Cannot communicate with the 2.4G dongle: {e}\n"
-                    "Check: dongle plugged in, udev rule "
-                    '(SUBSYSTEM=="hidraw", ATTRS{{idVendor}}=="05ac", ATTRS{{idProduct}}=="024f", MODE="0666"), '
+                    "Check: dongle plugged in, /etc/udev/rules.d/70-aula-s75pro.rules "
+                    '(SUBSYSTEM=="hidraw", ATTRS{idVendor}=="05ac", ATTRS{idProduct}=="024f", '
+                    'ATTRS{product}=="2.4G Dongle", TAG+="uaccess"), '
                     "and that no other process holds the device."
                 ) from e
             except Exception:
@@ -506,6 +517,8 @@ class AulaS75Pro:
     def raw_send(self, payload: bytes):
         """Send a raw 64-byte feature report (SET_REPORT; wired USB only)."""
         self._require_wired("raw_send()")
+        if self.dev is None:
+            raise RuntimeError("Device is not open; call open() or use a 'with' block first.")
         if len(payload) != REPORT_LEN:
             raise ValueError(f"payload must be exactly {REPORT_LEN} bytes, got {len(payload)}")
         data = bytes([REPORT_ID]) + bytes(payload)
@@ -514,6 +527,8 @@ class AulaS75Pro:
     def raw_get(self) -> bytes:
         """Read back a 64-byte feature report (GET_REPORT; wired USB only). Returns payload without report id."""
         self._require_wired("raw_get()")
+        if self.dev is None:
+            raise RuntimeError("Device is not open; call open() or use a 'with' block first.")
         data = self.dev.get_feature_report(REPORT_ID, REPORT_LEN + 1)
         return bytes(data[1:1 + REPORT_LEN])
 
@@ -536,7 +551,7 @@ class AulaS75Pro:
             try:
                 if not self.dev.read(DONGLE_PACKET_LEN, 2):
                     break
-            except Exception:
+            except (IOError, OSError):
                 break
 
         pkt = build_dongle_packet(cmd, length, seq, payload)
@@ -588,6 +603,9 @@ class AulaS75Pro:
         settle: float = 0.036,
     ) -> bytes:
         """Read GET_REPORT until the device ACKs the expected command word (byte[3] == 0x01) or rejects with 0xFF."""
+        self._require_wired("_wait_ack()")
+        if self.dev is None:
+            raise RuntimeError("Device is not open; call open() or use a 'with' block first.")
         expected_lo = expected_cmd & 0xFF
         expected_hi = (expected_cmd >> 8) & 0xFF
         last_resp = b""
@@ -596,7 +614,7 @@ class AulaS75Pro:
             try:
                 resp = self.raw_get()
                 last_resp = resp
-            except Exception:
+            except (IOError, OSError):
                 pass
             if len(resp) >= 4 and resp[0] == expected_lo and resp[1] == expected_hi:
                 if resp[3] == 0xFF:
@@ -782,6 +800,7 @@ class AulaS75Pro:
 
 
     def set_global_lighting(self, effect: int, r: int, g: int, b: int, brightness: int = 5, speed: int = 3, direction: int = 0, option: int = 0):
+        effect = _validate_int_range(effect, "effect", 0, 19)
         payload = self._build_mode_payload(
             effect=effect, r=r, g=g, b=b,
             brightness=brightness, speed=speed,
@@ -821,6 +840,7 @@ class AulaS75Pro:
         # Anything not in the set is either reserved (slot 0), a gap in the
         # keyboard matrix, or close enough to the trailer at offsets 574–575
         # (slot 143) to be unsafe.
+        brightness = _validate_int_range(brightness, "brightness", 0, 5)
         for idx, rgb in key_colors.items():
             if idx not in PHYSICAL_INDICES:
                 raise ValueError(
@@ -829,10 +849,7 @@ class AulaS75Pro:
                 )
             r, g, b = rgb
             for name, val in (("r", r), ("g", g), ("b", b)):
-                if not (0 <= val <= 255):
-                    raise ValueError(
-                        f"key {idx}: {name}={val} is not in range 0–255."
-                    )
+                _validate_int_range(val, f"key {idx} {name}", 0, 255)
 
         # ---- build the 576-byte table buffer ---------------------------------
         table = bytearray(TABLE_SIZE)
@@ -944,6 +961,16 @@ class AulaS75Pro:
         Extracted from set_global_lighting so set_custom_lighting can call
         _write_lighting_sequence directly with the right mode (0x80).
         """
+        if isinstance(effect, bool) or not isinstance(effect, int) or (not (0 <= effect <= 19) and effect != 0x80):
+            raise ValueError(f"effect must be 0..19 or 0x80, got {effect!r}")
+        r = _validate_int_range(r, "r", 0, 255)
+        g = _validate_int_range(g, "g", 0, 255)
+        b = _validate_int_range(b, "b", 0, 255)
+        brightness = _validate_int_range(brightness, "brightness", 0, 5)
+        speed = _validate_int_range(speed, "speed", 0, 5)
+        direction = _validate_int_range(direction, "direction", 0, 2)
+        option = _validate_int_range(option, "option", 0, 1)
+
         payload = bytearray(REPORT_LEN)
         payload[0] = effect
         if effect != 0:
@@ -973,18 +1000,18 @@ class AulaS75Pro:
             payload_16 = _le16(CMD_GENERAL_SETTINGS) + body + bytes(3) + TRAILER
             return self._dongle_transact(DONGLE_CMD_RTC, DONGLE_SETTINGS_LEN, 0x00, payload_16)
 
-        def step(cmd, payload=b"", trailer=False):
-            self.send_cmd(cmd, payload, trailer=trailer, delay=0.0)
-            time.sleep(0.036)               # capture cadence: one GET per SET
-            return self.raw_get()
+        self.send_cmd(CMD_OPEN)
+        self._wait_ack(CMD_OPEN)
 
-        step(CMD_OPEN)                          # expect 04 18 00 01 ...
-        step(CMD_RTC_WRITE, bytes([0, 0, 0, 0, 0, 0, 1]))    # expect 04 28 00 01 ...
-        step(CMD_GENERAL_SETTINGS, body, trailer=True)       # expect echo of body
-        resp = step(CMD_COMMIT)                 # expect 04 02 00 01
-        if len(resp) >= 4 and resp[3] != 0x01:
-            print(f"warning: commit status {resp[3]:#04x} (capture saw 0x01); "
-                  "the RTC write appears to apply anyway - check the TFT clock.")
+        self.send_cmd(CMD_RTC_WRITE, bytes([0, 0, 0, 0, 0, 0, 1]))
+        self._wait_ack(CMD_RTC_WRITE)
+
+        payload = bytes(build_report(CMD_GENERAL_SETTINGS, body, trailer=True))
+        self.raw_send(payload)
+        time.sleep(0.036)
+
+        self.send_cmd(CMD_COMMIT, delay=0.036)
+        return self._wait_ack(CMD_COMMIT)
 
     # ---- State-1 read helpers & firmware info/battery/underglow -------------
     def _read_state1_chunks(

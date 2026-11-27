@@ -1,6 +1,6 @@
 # AULA S75 Pro Firmware Reverse-Engineering Audit (`s75pro_fw_v1.03.bin`)
 
-This document records the complete, firmware-verified and hardware-tested reverse-engineering findings for the AULA S75 Pro (`VID=0x0C45`, `PID=0x800A`, MCU firmware `v1.03`). All claims below are traced directly to ARM Cortex-M Thumb instructions and Ghidra decompilation of `s75pro_fw_v1.03.bin` (read-only analysis) and cross-checked against `DeviceDriver.exe.c`, Wireshark captures, and live USB hardware tests via [`test_underglow.py`](test_underglow.py).
+This document records the complete, firmware-verified and hardware-tested reverse-engineering findings for the AULA S75 Pro (`VID=0x0C45`, `PID=0x800A`, MCU firmware `v1.03`). All claims below are traced directly to ARM Cortex-M Thumb instructions and Ghidra decompilation of `s75pro_fw_v1.03.bin` (read-only analysis) and cross-checked against `DeviceDriver.exe.c`, Wireshark captures, and live USB hardware tests (now integrated into [`aula_s75pro.py`](aula_s75pro.py)).
 
 ---
 
@@ -143,7 +143,7 @@ This subtle firmware quirk was caught during live hardware testing of `0x0504` a
 4. **Trailing-chunk checksum accounting (`count = chunks + 1`):**
    - For all 7 flash-read opcodes, Phase 2 sets `count = chunks + 1`, so on the host's final `GET_REPORT`, `FUN_0000407a` preloads and sums one extra trailing 64-byte flash block (e.g., `0x8FC0–0x8FFF` for `0x0504` or `0x9840–0x987F` for `0x1204`) before advancing to State 3.
    - Consequently, the 32-bit LE commit checksum in `0x0204` `resp[4..7]` equals either `sum(chunks)` (if the trailing 64 B block is `0x00`) or `sum(chunks) + 64 * 0xFF` (`+0x3FC0`, if the trailing block is erased `0xFF`).
-5. **Host handling pattern** (implemented in [`test_underglow.py::_read_flash_chunks`](test_underglow.py#L106-L159)):
+5. **Host handling pattern** (implemented in [`AulaS75Pro._read_state1_chunks`](aula_s75pro.py)):
    - After `SET_REPORT`, inspect `resp1 = GET_REPORT`:
      - If `resp1[0:2] == [0x04, cmd_hi]` and `resp1[3] == 0xFF` → abort (rejected/busy).
      - If `resp1[0:2] == [0x04, cmd_hi]` and `resp1[3] == 0x01` → clean bit-1 path; read `chunks` additional `GET_REPORT`s.
@@ -159,7 +159,7 @@ All LEDs share the single RGB RAM buffer (`0x20001838` R, `0x2000195E` G, `0x200
 
 | Zone | LED Indices (`0x00014D2C` / RAM) | Runtime State & Renderer | Control Surface |
 |---|---|---|---|
-| **Main Keys (82 keys)** | Standard key matrix (`PHYSICAL_INDICES`) | Main effect engine (`0x20000190` / `0x8000` / `0x9800`) | USB `0x1304` (`0x00–0x13`, `0x80`), `0x2304`, `0x2004`, and on-board `Fn` lighting hotkeys |
+| **Main Keys (80 addressable RGB keys; 82 matrix positions)** | Standard key matrix (`PHYSICAL_INDICES`) | Main effect engine (`0x20000190` / `0x8000` / `0x9800`) | USB `0x1304` (`0x00–0x13`, `0x80`), `0x2304`, `0x2004`, and on-board `Fn` lighting hotkeys |
 | **Row-6 Side / Underglow (14 LEDs)** | `0x7E–0x8B` (14 contiguous LEDs) | State struct at `0x20000194` (mode `0..4`, color, brightness, speed); rendered by `FUN_0000e1fc` (`0x0000E0B8–0x0000E440`) directly into `0x20001838`/`195E`/`1A84` | **USB `0x1304` `payload[0] = 0x20–0x24`** (mode only) + **`Fn + Right Shift`** (cycle mode `0..4`) + **`Fn + /?`** (cycle preset color) |
 | **Row-5 Accent Bar (5 LEDs)** | `0x6C, 0x6D, 0x6E, 0x70, 0x71` | State at `0x200001DC` (independent subsystem) | **`Fn + Z`** only — **no USB HID command exists** in `s75pro_fw_v1.03.bin` |
 
@@ -169,49 +169,44 @@ All LEDs share the single RGB RAM buffer (`0x20001838` R, `0x2000195E` G, `0x200
   - Color, brightness, and speed bytes in `payload[1..63]` are **never read** by `FUN_00003f42` for `0x20–0x24`. Consequently, **unlike main-key effects (`0x00–0x13` / `cli.py color`), the static underglow color (`0x22`) cannot be set over USB**; changing static/breathing underglow color is hardware-only via **`Fn + /?`**.
 - **Why `wireshark/SideLightsRed.pcapng` frame 3987 had no visible effect:**
   - Frame 3987 sent a standard main-key `0x1304` payload (`payload[0] = 0x01` static red, not `0x20–0x24`) or targeted the wrong subsystem; furthermore, `DeviceDriver.exe` never exposes a per-color USB setter for `0x20000194` — only `0x20–0x24` mode selection exists in firmware.
-- **Hardware verification (`test_underglow.py`):**
-  - `python3 test_underglow.py --mode 4` turned the physical underglow LEDs **off** and returned the exact predicted 32-bit LE commit checksum **`0x00003C4F`**.
-  - `python3 test_underglow.py --mode 0` restored the physical underglow LEDs to **flowing rainbow** and returned **`0x00003C4F`**.
+- **Hardware verification (`AulaS75Pro.set_underglow_mode`):**
+  - `python3 cli.py underglow off` (`mode=4`) turned the physical underglow LEDs **off** and returned the exact predicted 32-bit LE commit checksum **`0x00003C4F`** (and saved/restored flash `0x9800`).
+  - `python3 cli.py underglow flowing` (`mode=0`) restored the physical underglow LEDs to **flowing rainbow** and returned **`0x00003C4F`**.
 
 ---
 
-## 4. Verified Fixes for `aula_s75pro.py`
+## 4. Verified Fixes Applied in `aula_s75pro.py`
 
-All items below are verified against [`aula_s75pro.py`](aula_s75pro.py) and `s75pro_fw_v1.03.bin`.
+All items below have been implemented and verified against [`aula_s75pro.py`](aula_s75pro.py) and `s75pro_fw_v1.03.bin`.
 
-### 4.1 Byte-Swapped `CMD_LIGHT_READ` (`aula_s75pro.py:72`, `PROTOCOL.md:37`)
-- **Bug:** `CMD_LIGHT_READ = 0x04F5` puts `F5 04` on the wire (rejected with `0xFF`, because State 0 requires `buf[0] == 0x04`).
-- **Fix:** Change to **`CMD_LIGHT_READ = 0xF504`** (wire bytes `04 F5`), which matches `0x000042FA` and reads live RGB RAM (`0x20001838`/`195E`/`1A84`) cleanly.
+### 4.1 `CMD_LIGHT_READ = 0xF504` Wire Endianness
+- **Previous bug:** `0x04F5` put `F5 04` on the wire (rejected with `0xFF`, because State 0 requires `buf[0] == 0x04`).
+- **Implemented:** `CMD_LIGHT_READ = 0xF504` (wire bytes `04 F5`), matching `0x000042FA` and reading live RGB RAM (`0x20001838`/`195E`/`1A84`) cleanly via `read_live_rgb()`.
 
 ### 4.2 32-bit Little-Endian Commit Checksums (`resp[4..7]`)
 - **Firmware (`0x00003E74–0x00003E82`):** `0x0204` commit writes the full **32-bit little-endian** accumulated byte sum (`hid_ctx+0x10`) into `resp[4..7]`.
-- **Fix 1 — `write_general_settings()` ([`aula_s75pro.py:371-379`](aula_s75pro.py#L371-L379)):**
-  - Currently compares `resp[4]` against `(fn_switch + sleep_time + key_response_time) & 0xFF`. This only passed by coincidence when all three enable flags were `False` because `0x01 + 0xAA + 0x55 == 0x100 == 0 (mod 256)`. As soon as any flag is `True`, the check fails with a false mismatch.
-  - Replace with `mcu_sum = struct.unpack_from("<I", resp, 4)[0]` compared against `sum(written_64_byte_payload)`.
-- **Fix 2 — `set_custom_lighting()` ([`aula_s75pro.py:518,571-573`](aula_s75pro.py#L518)):**
-  - Currently truncates to 16-bit (`sum(table) & 0xFFFF` vs. `ack[4] | (ack[5] << 8)`).
-  - Update to 32-bit (`expected_checksum = sum(table) & 0xFFFFFFFF` vs. `struct.unpack_from("<I", ack, 4)[0]`).
+- **Implemented:** `parse_commit_checksum(resp)` unpacks `<I` from `resp[4..7]` and is used consistently across `write_general_settings()`, `_write_lighting_sequence()`, `set_custom_lighting()`, `_read_state1_chunks()`, and `set_underglow_mode()`.
 
-### 4.3 `0x1704` General Settings Bitfields & Redundant Loop ([`aula_s75pro.py:321-382`](aula_s75pro.py#L321-L382))
+### 4.3 `0x1704` General Settings Bitfields & Single-Pass Write (`write_general_settings()`)
 Traced from `FUN_00003f42` (writes `0x00009000`) → `FUN_00003412` / `FUN_000046d0` / `FUN_00003a08`:
 
-| Payload Byte (`0x9000 + offset`) | Current Name in `aula_s75pro.py` | Actual Firmware Meaning |
+| Payload Byte (`0x9000 + offset`) | Parameter in `aula_s75pro.py` | Firmware Meaning |
 |---|---|---|
 | `payload[0..1]` | `0x0100` (`CMD_GENERAL_SETTINGS`) | Stored at `0x9000..0x9001` (packed into low bits of `hid_ctx[1]`) |
-| `payload[2]` | `fn_enabled` (wrong) | **Disable `Alt+Tab`** (`1` = blocked; packed into `0x200000BD`) |
-| `payload[3]` | `sleep_enabled` (wrong) | **Disable `Alt+F4`** (`1` = blocked; packed into `0x200000BD`) |
-| `payload[4]` | `key_response_enabled` (wrong) | **Win-Lock** when `*(uint8_t*)0x2000004D == 0` (`1` = Win key locked; packed into `0x200000BD`) |
+| `payload[2]` | `disable_alt_tab` | **Disable `Alt+Tab`** (`1` = blocked; packed into `0x200000BD`) |
+| `payload[3]` | `disable_alt_f4` | **Disable `Alt+F4`** (`1` = blocked; packed into `0x200000BD`) |
+| `payload[4]` | `win_lock` | **Win-Lock** when `*(uint8_t*)0x2000004D == 0` (`1` = Win key locked; packed into `0x200000BD`) |
 | `payload[5]` | `fn_switch` | `0` = normal hold Fn, `1` = sticky Fn toggle (`0x200000C3`) |
 | `payload[6]` | `sleep_time` | `0` = off, `1` = 1 min (`600`), `2` = 5 min (`3000`), `3` = 30 min (`18000`) in 100 ms ticks (`FUN_000046d0`) |
 | `payload[7]` | unused gap (`0`) | Unused |
 | `payload[8]` | `key_response_time` | Debounce scan threshold (`FUN_00003a08`): `1` → 2, `2`/default → 3, `3` → 7, `4` → 10, `5` → 14 |
 
-- **Redundant `for profile_index in (0, 1):` loop (`aula_s75pro.py:339-346`):** In `0x00004540`, `0x1704` completely ignores `buf[2..3]` (`1, profile_index`) and writes to `0x00009000` unconditionally. Sending it twice just erases and rewrites the same flash page twice; a single pass is sufficient.
+- **Single-pass write:** `0x00004540` ignores `buf[2..3]` and writes `0x00009000` unconditionally; `write_general_settings()` performs a single `0x1704` pass.
 
-### 4.4 New Verified Commands to Add to `aula_s75pro.py`
-- **`CMD_DEVICE_INFO = 0x0504`:** Reads flash `0x00008F80` (`chunks=1` or `2`). Decodes `tag = u16[0]` (`0x3040`), `VID = u16[4]` (`0x0C45`), `PID = u16[6]` (`0x800A`), `fw_minor = byte[8]` (`3`), `fw_major = byte[9]` (`1`) → `v1.03`.
-- **`CMD_BATTERY_LEVEL = 0xF604`:** Single `SET_REPORT` + `GET_REPORT` in State 0 (no commit). Returns quantized battery level `0–5` in `resp[4]` (`0`: `<6%`, `1`: `6–25%`, `2`: `26–50%`, `3`: `51–75%`, `4`: `76–95%`, `5`: `96–100%`).
-- **`CMD_LIGHTING_READ = 0x1204`:** Reads the 64-byte flash lighting config page at `0x00009800` (`chunks=1`). Must use a helper handling both the stale bit-1 and clean bit-1 paths (see §2.5).
+### 4.4 Verified Read & Query Commands in `aula_s75pro.py`
+- **`CMD_DEVICE_INFO = 0x0504` (`read_device_info()`):** Reads flash `0x00008F80` (or 2.4G `0x02`), decoding `tag`, `VID`, `PID`, and `fw_version`.
+- **`CMD_BATTERY_LEVEL = 0xF604` (`read_battery_level()`):** Single `SET_REPORT` + `GET_REPORT` in State 0 returning quantized level `0–5` in `resp[4]` (or exact `0–100%` over 2.4G `0x20`).
+- **`CMD_LIGHTING_READ = 0x1204` (`read_lighting_config()`):** Reads flash lighting config page `0x00009800` via bit-1-aware `_read_state1_chunks()`.
 
 ### 4.5 `0x1204` Save-and-Restore Workaround for the `0x1304` `0x20–0x24` Flash `0x9800` Erase Bug
 
@@ -225,24 +220,23 @@ Traced from `FUN_00003f42` (writes `0x00009000`) → `FUN_00003412` / `FUN_00004
    - If the active lighting was set via on-board hotkeys (`flash[0x8002] != 0xFF`), reboot restores from `0x8000` normally.
    - **If the active lighting was set via USB (`flash[0x8002] == 0xFF`)**, `0x0000DB86` calls `FUN_00003eae()`, which reads `DAT_00009800`. Because `0x9800` was left erased (`0xFF`), `FUN_00003eae()` returns early and **custom/USB main-key lighting is lost after reboot**.
 
-#### Recommended Safe Workaround in `aula_s75pro.py`
-When implementing `set_underglow_mode(mode: int)`:
-1. **Save:** Read the current 64-byte lighting page at `0x9800` via `0x1204` + `0x0204` commit (using the bit-1-aware reader from §2.5).
-2. **Apply underglow:** Send `0x1804` → `0x1304` (`chunks=1`) → `[0x20 + mode, 0, ...]` → `0x0204` commit (verifying `resp[4..7] == 0x00003C4F`) → `0xF004` finalize (persists `0x20000194` into `0x8000`).
-3. **Restore `0x9800`:** If the saved 64-byte snapshot from step 1 is **not** all-`0xFF` and **not** all-`0x00` (i.e., valid USB main-key lighting was stored there), immediately rewrite that exact 64-byte payload back to `0x9800` via a standard `0x1304` write → `0x0204` commit → `0xF004` finalize.
+#### Implemented Workaround in `AulaS75Pro.set_underglow_mode()`
+1. **Save:** Reads the current 64-byte lighting page at `0x9800` via `0x1204` (`read_lighting_config()`).
+2. **Apply underglow:** Sends `0x1804` → `0x1304` (`chunks=1`) → `[0x20 + mode, 0, ...]` → `0x0204` commit (checking `resp[4..7] == EXPECTED_UNDERGLOW_ERASED_CHECKSUM`) → `0xF004` finalize (persists `0x20000194` into `0x8000`).
+3. **Restore `0x9800`:** If the saved snapshot is populated (neither all-`0xFF`, all-`0x00`, nor `0x20–0x24`), immediately rewrites that exact 64-byte payload back to `0x9800` via `_write_lighting_sequence()` (`0x1304` → `0x0204` → `0xF004`).
 
 ### 4.6 Other Protocol Clarifications for `aula_s75pro.py` / `PROTOCOL.md`
-- **`0x2004` Live Streaming:** Both `GET_REPORT` calls in State 0 are mandatory because Phase 2 (`0x00004380`) only transitions to State 2 on `GET_REPORT`.
-- **`0x2304` Custom RGB Table:** `0x0000CBBA` only checks `(word & 0xFF) == slot_idx` per 4-byte slot and never inspects the `AA 55` trailer (unlike keymaps `0x1104` / `0x2704`, where `FUN_0000275c` checks `0x55AA0000` at `0x963C` / `0xAE3C`). Keeping `AA 55` at offsets `574–575` remains harmless and matches the official driver's checksum.
-- **`0x2804` RTC Sync ([`aula_s75pro.py:620-660`](aula_s75pro.py#L620-L660)):** State 6 (`0x00003CFC`) only validates `buf[2] == 0x5A` and copies `buf[3..8]` (`yy, mm, dd, HH, MM, SS`); `buf[0..1]`, `weekday`, and `AA 55` are ignored.
+- **`0x2004` Live Streaming (`AulaStreamer`):** Both `GET_REPORT` calls in State 0 are mandatory because Phase 2 (`0x00004380`) only transitions to State 2 on `GET_REPORT`.
+- **`0x2304` Custom RGB Table (`set_custom_lighting()`):** `0x0000CBBA` only checks `(word & 0xFF) == slot_idx` per 4-byte slot and never inspects the `AA 55` trailer (unlike keymaps `0x1104` / `0x2704`, where `FUN_0000275c` checks `0x55AA0000` at `0x963C` / `0xAE3C`). Keeping `AA 55` at offsets `574–575` remains harmless and matches the official driver's checksum.
+- **`0x2804` RTC Sync (`sync_rtc()`):** State 6 (`0x00003CFC`) only validates `buf[2] == 0x5A` and copies `buf[3..8]` (`yy, mm, dd, HH, MM, SS`); `buf[0..1]`, `weekday`, and `AA 55` are ignored.
 
 ---
 
-## 5. Verified Fixes for `aula_s75pro_screen.py`
+## 5. Verified Fixes Applied in `aula_s75pro_screen.py`
 
-All items below are verified against [`aula_s75pro_screen.py`](screenUpload/aula_s75pro_screen.py) and `s75pro_fw_v1.03.bin`.
+All items below are implemented and verified against [`aula_s75pro_screen.py`](screenUpload/aula_s75pro_screen.py) and `s75pro_fw_v1.03.bin`.
 
-### 5.1 `WIRE_TICK_MS = 2` (NOT `20`) ([`aula_s75pro_screen.py:135`](screenUpload/aula_s75pro_screen.py#L135))
+### 5.1 `WIRE_TICK_MS = 2`
 - **Clock-tree proof in firmware:**
   1. `FUN_00013bfa` configures PLL = **48 MHz**, HCLK prescaler = `1`.
   2. `FUN_00006f8c` sets SysTick `RVR = 23999` (`0x5DBF`) → `48,000,000 / 24,000 = 2000 Hz` = **0.5 ms** per SysTick IRQ (`FUN_00006f9c`).
@@ -251,20 +245,19 @@ All items below are verified against [`aula_s75pro_screen.py`](screenUpload/aula
      - `pbVar2[2]` = **2 ms** (every 4 SysTicks)
   4. `FUN_0000042e` derives `pbVar2[5]` = **100 ms** (independently confirmed by `FUN_000046d0` sleep timeouts: `600` = 1 min, `3000` = 5 min, `18000` = 30 min).
   5. The TFT GIF animation scheduler **`FUN_00011a84`** increments its frame counter on **`pbVar2[2]` (2 ms)**.
-- **Driver cross-check (`DeviceDriver.exe.c:30483`):** The official Windows driver stores GIF frame durations in **milliseconds** (not centiseconds) and divides by `2` to produce 2 ms ticks. `aula_s75pro_screen.py` mistakenly assumed the driver's internal field was in centiseconds, resulting in `WIRE_TICK_MS = 20` (10× too slow on-wire, making animations play **10× too fast**).
-- **Fix:** Set **`WIRE_TICK_MS = 2`**.
+- **Driver cross-check (`DeviceDriver.exe.c:30483`):** The official Windows driver stores GIF frame durations in **milliseconds** and divides by `2` to produce 2 ms ticks.
+- **Implemented:** `WIRE_TICK_MS = 2` in `screenUpload/aula_s75pro_screen.py`.
 
-### 5.2 Delay Floor `0x10` (32 ms) and Ceiling `0xFF` (510 ms) ([`aula_s75pro_screen.py:205,311,354`](screenUpload/aula_s75pro_screen.py#L311))
+### 5.2 Delay Floor `0x10` (32 ms) and Ceiling `0xFF` (510 ms)
 - **Firmware (`FUN_00011a84`):** Before comparing against the elapsed 2 ms counter, the firmware executes:
   ```c
   if (bVar1 < 0x10) {
       period = 0x19;  // silently replaces < 16 (32 ms) with 25 (50 ms)!
   }
   ```
-- **Consequence:** Encoding any wire delay in `1..15` (`2..30 ms`) is silently overridden by the MCU to `0x19` (`50 ms` = 20 fps), causing unexpected slowdowns for high-FPS clips.
-- **Fix:** Clamp encoded wire delay ticks to **`[0x10, 0xFF]`** (`16..255` ticks = **`32 ms – 510 ms`** per frame, i.e., `~1.96–31.25 fps`), and update CLI `--delay` help/units to clearly distinguish milliseconds vs. 2 ms wire ticks.
+- **Implemented:** `clamp_wire_delay()` and `ms_to_wire_delay()` clamp encoded wire delay ticks to **`[0x10, 0xFF]`** (`16..255` ticks = **`32 ms – 510 ms`** per frame, i.e., `~1.96–31.25 fps`), and CLI `--delay` accepts milliseconds (`32–510`).
 
-### 5.3 Hard Frame Cap = `140` Frames (`16 MB` 24-Bit SPI Flash Boundary; RAM Preamble Holds `191`) ([`aula_s75pro_screen.py`](screenUpload/aula_s75pro_screen.py))
+### 5.3 Hard Frame Cap = `140` Frames (`16 MB` 24-Bit SPI Flash Boundary; RAM Preamble Holds `191`)
 - **Primary Limit — 24-Bit SPI Flash Address Wrap (`FUN_00007858`, `FUN_000078be`, `FUN_00007964`):**
   - The external SPI flash helpers transmit 24-bit addresses (`0x000000–0xFFFFFF` = **16 MB** `0x01000000`). `0x7204` (`0x000045d4`) always starts writing at `0x00750000`, erasing/programming in `4 KB` (`0x1000`) chunks (`PREAMBLE = 256` bytes followed by pixel stride `0x0000FD20` = `64,800` bytes at `0x750100`).
   - `140` frames require `256 + 140 × 64,800 = 9,072,256` bytes → **`2,215` chunks (`0x008A7000`)**, ending cleanly at **`0x00750000 + 0x008A7000 = 0x00FF7000 <= 0x01000000`**.
@@ -272,16 +265,16 @@ All items below are verified against [`aula_s75pro_screen.py`](screenUpload/aula
 - **Secondary RAM Limit (`FUN_0001047c` → `FUN_00010460(0x750000)`):**
   - Calls `FUN_00007882(0x750000, 0xC0)`, reading only **`192` bytes (`0xC0`)** from the 256-byte SPI preamble into RAM at **`0x200021DA`** (`N_frames` + **`191` delay slots** at `0x200021DB–0x20002299`). Uploading `>= 192` frames would also read past `0x20002299` into live fuel-gauge / battery RAM at `0x200022A0+`.
 - **VFR Video Deduplication:** `iio.imiter(..., plugin="FFMPEG")` decodes VFR clips (such as `4.0 s` MP4s reported with `fps=0.58`) into duplicated raw frames. `extract_video_frames()` derives actual `ms_per_raw = duration * 1000 / total_decoded_raw` when EOF duration disagrees with `meta['fps']`, collapses consecutive identical RGB565 runs via `collapse_video_runs()`, and splits holds `> 510 ms` into the minimum number of `<= 510 ms` copies (or 1 frame per unique run when `--delay` is given).
-- **Fix:** Tighten `MAX_FRAMES = 140` (keeping `PREAMBLE = 256`) across `make_cmd_upload()`, `build_buffer()`, `extract_gif_frames()`, and `extract_video_frames()`, and add `collapse_video_runs()` for VFR videos.
+- **Implemented:** `MAX_FRAMES = 140` (with `PREAMBLE = 256`) enforced across `make_cmd_upload()`, `build_buffer()`, `extract_gif_frames()`, `extract_video_frames()`, and `webui/server.py`, plus State-3 `CMD_END` + `ctrl_get()` completion and mid-State-5 `2.1 s` watchdog recovery in `upload()`.
 
-### 5.4 Ignored `0x7204` `cmd[2]` Mode Byte ([`aula_s75pro_screen.py:162,167,175`](screenUpload/aula_s75pro_screen.py#L167))
+### 5.4 Ignored `0x7204` `cmd[2]` Mode Byte
 - In firmware (`0x000045D4`), `0x7204` **never reads `buf[2]`** (`0x03` still vs. `0x05` GIF); it always sets SPI base = `0x00750000` and reads `chunks = buf[8] | (buf[9] << 8)`. In `DeviceDriver.exe.c:30381/30595`, `cmd[2]` was merely `LCDViewList::GetCurSel() + 1`. Keeping `0x03`/`0x05` is harmless for wire compatibility, but the firmware distinguishes still vs. GIF solely from `N_frames` at SPI `0x00750000`.
 
 ---
 
 ## 6. Explicit Safety Exclusions (DO NOT IMPLEMENT)
 
-The following two firmware mechanisms exist in `s75pro_fw_v1.03.bin` and **must never be exposed** in user-facing scripts or accidentally triggered:
+The following three firmware mechanisms exist in `s75pro_fw_v1.03.bin` and **must never be exposed** in user-facing scripts or accidentally triggered:
 
 1. **Opcode `0x3804` (`04 38`, `0x0000459E` → State 5 `0x00003D54`):**
    - **Effect:** Opens the `EP 3 OUT` 4096-byte SPI flash writer with base address **`0x00000000`** instead of `0x00750000`.
@@ -292,3 +285,8 @@ The following two firmware mechanisms exist in `s75pro_fw_v1.03.bin` and **must 
    - **Effect:** Receiving the 8-byte signature `AA 42 89 5A FF 71 62 CC` on EP0 immediately disables interrupts/peripherals and jumps into the MCU ROM ISP firmware-update bootloader (`FUN_0000014c`).
    - **Risk:** Drops the keyboard off the normal USB HID bus into raw flash-programming mode; sending malformed data in ISP mode can brick the MCU.
    - **Rule:** Never construct, test, or transmit this magic byte sequence.
+
+3. **Wireless 2.4G OTA / Bootloader Opcodes (`0x7F`, `0x80–0x8F` in `FUN_00005990`):**
+   - **Effect:** Wireless firmware update / bootloader flashing opcodes handled inside the 2.4G receiver command dispatcher.
+   - **Risk:** Malformed RF flashing traffic can brick the keyboard or 2.4G wireless dongle.
+   - **Rule:** Never construct, expose, or transmit `0x7F` or `0x80–0x8F` as 2.4G command IDs (note: `0x80` as `payload[0]` inside `0x05` is the safe custom-RGB lighting mode selector).

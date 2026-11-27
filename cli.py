@@ -79,6 +79,18 @@ def format_effects_table() -> str:
     return "\n".join(lines)
 
 
+def _ranged_int(lo: int, hi: int):
+    def _parse(value: str) -> int:
+        try:
+            n = int(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"invalid integer value: {value!r}") from exc
+        if not (lo <= n <= hi):
+            raise argparse.ArgumentTypeError(f"value {n} out of range (must be {lo}..{hi})")
+        return n
+    return _parse
+
+
 def _parse_effect(value: str) -> int:
     key = value.strip().lower()
     if key in EFFECTS:
@@ -225,7 +237,7 @@ def cmd_scan(args):
     devices = hid.enumerate()
     if not devices:
         print("hidapi sees NO HID devices at all. This is almost always a permissions "
-              "issue (see README/CAPTURING.md for the udev rule), or hidapi itself "
+              "issue (see README.md for udev rules), or hidapi itself "
               "isn't installed correctly.")
         return
     found_aula = False
@@ -318,8 +330,6 @@ def cmd_set_color(args):
     print(f"Set color to RGB({args.r}, {args.g}, {args.b}) using effect ID {args.effect}")
 
 def cmd_custom_lighting(args):
-    from aula_s75pro import PHYSICAL_INDICES
-
     if not args.all and not args.keys:
         print("error: supply either --all or --keys KEY [KEY ...]", file=sys.stderr)
         sys.exit(1)
@@ -415,18 +425,18 @@ def main():
     sub.add_parser("raw-get", help="read back a raw 64-byte feature report").set_defaults(func=cmd_raw_get)
 
     sp = sub.add_parser("set-key-response", help="set the key response time")
-    sp.add_argument("value", type=int, help="raw value to send (see PROTOCOL.md)")
-    sp.add_argument("--sleep", type=int, default=0, help="current sleep_time value to preserve")
-    sp.add_argument("--fn", type=int, default=0, help="current fn_switch value to preserve")
+    sp.add_argument("value", type=_ranged_int(0, 5), help="debounce preset 0-5 (see PROTOCOL.md)")
+    sp.add_argument("--sleep", type=_ranged_int(0, 3), default=0, help="current sleep_time value (0-3) to preserve")
+    sp.add_argument("--fn", type=_ranged_int(0, 1), default=0, help="current fn_switch value (0-1) to preserve")
     sp.add_argument("--disable-alt-tab", action="store_true", help="disable Alt+Tab")
     sp.add_argument("--disable-alt-f4", action="store_true", help="disable Alt+F4")
     sp.add_argument("--win-lock", action="store_true", help="enable Win-Lock")
     sp.set_defaults(func=cmd_set_key_response)
 
     sp = sub.add_parser("set-sleep-time", help="set the sleep timer")
-    sp.add_argument("value", type=int, help="raw value to send (see PROTOCOL.md)")
-    sp.add_argument("--keyresponse", type=int, default=0, help="current key_response_time value to preserve")
-    sp.add_argument("--fn", type=int, default=0, help="current fn_switch value to preserve")
+    sp.add_argument("value", type=_ranged_int(0, 3), help="sleep preset 0-3 (0=off, 1=1m, 2=5m, 3=30m)")
+    sp.add_argument("--keyresponse", type=_ranged_int(0, 5), default=0, help="current key_response_time value (0-5) to preserve")
+    sp.add_argument("--fn", type=_ranged_int(0, 1), default=0, help="current fn_switch value (0-1) to preserve")
     sp.add_argument("--disable-alt-tab", action="store_true", help="disable Alt+Tab")
     sp.add_argument("--disable-alt-f4", action="store_true", help="disable Alt+F4")
     sp.add_argument("--win-lock", action="store_true", help="enable Win-Lock")
@@ -443,9 +453,9 @@ def main():
         description='Set the main-key global lighting effect (0x1304, effect IDs 0-19).',
         epilog=format_effects_table(),
     )
-    parser_color.add_argument('r', type=int, help='Red channel (0-255)')
-    parser_color.add_argument('g', type=int, help='Green channel (0-255)')
-    parser_color.add_argument('b', type=int, help='Blue channel (0-255)')
+    parser_color.add_argument('r', type=_ranged_int(0, 255), help='Red channel (0-255)')
+    parser_color.add_argument('g', type=_ranged_int(0, 255), help='Green channel (0-255)')
+    parser_color.add_argument('b', type=_ranged_int(0, 255), help='Blue channel (0-255)')
     parser_color.add_argument(
         '--effect', type=_parse_effect, default=1, metavar='ID_OR_NAME',
         help='Effect ID (0-19) or name (default: 1=static); see list below',
@@ -456,19 +466,19 @@ def main():
         help='Show all available effect IDs (0-19) and parameter details, then exit',
     )
     parser_color.add_argument(
-        '--brightness', type=int, default=5,
+        '--brightness', type=_ranged_int(0, 5), default=5,
         help='Brightness level 0-5 (0=dimmest/off, 5=max; default: 5)',
     )
     parser_color.add_argument(
-        '--speed', type=int, default=3,
+        '--speed', type=_ranged_int(0, 5), default=3,
         help='Animation speed 0-5 (0=slowest, 5=fastest; default: 3)',
     )
     parser_color.add_argument(
-        '--dir', type=int, default=0,
+        '--dir', type=_ranged_int(0, 2), default=0,
         help='Animation direction: 0=Right/Down, 1=Left, 2=Up (default: 0)',
     )
     parser_color.add_argument(
-        '--opt', type=int, default=0,
+        '--opt', type=_ranged_int(0, 1), default=0,
         help='Color option: 0=Solid RGB (use r g b), 1=Hardware multi-color/rainbow (default: 0)',
     )
     parser_color.set_defaults(func=cmd_set_color)
@@ -482,9 +492,9 @@ def main():
             'Run \'list-keys\' to see all valid key names.'
         ),
     )
-    parser_custom.add_argument('r', type=int, help='Red component (0-255)')
-    parser_custom.add_argument('g', type=int, help='Green component (0-255)')
-    parser_custom.add_argument('b', type=int, help='Blue component (0-255)')
+    parser_custom.add_argument('r', type=_ranged_int(0, 255), help='Red component (0-255)')
+    parser_custom.add_argument('g', type=_ranged_int(0, 255), help='Green component (0-255)')
+    parser_custom.add_argument('b', type=_ranged_int(0, 255), help='Blue component (0-255)')
     parser_custom.add_argument(
         '--keys', nargs='+', metavar='KEY',
         help='Key names to colour (e.g. --keys Esc W A S D Enter Space)',
@@ -493,7 +503,7 @@ def main():
         '--all', action='store_true',
         help='Apply the colour to every physical key on the board',
     )
-    parser_custom.add_argument('--brightness', type=int, default=5,
+    parser_custom.add_argument('--brightness', type=_ranged_int(0, 5), default=5,
                                help='Custom-mode brightness (0-5, default 5)')
     parser_custom.set_defaults(func=cmd_custom_lighting)
 

@@ -406,6 +406,38 @@ class WebUiWiredApiTests(unittest.TestCase):
             after = json.loads(raw_after)
             self.assertTrue(after["connected"])
             self.assertEqual(after["mode"], "usb")
+
+            # 4. Error path: upload failure still closes backend and waits for HID reattach under hw_lock
+            self.backend_closed = False
+            reattach_calls = 0
+
+            def counting_reattach_factory(mode: str):
+                nonlocal reattach_calls
+                reattach_calls += 1
+                return orig_kb_factory(mode)
+
+            self.server.kb_factory = counting_reattach_factory
+            orig_upload = self.server.screen_module.upload
+
+            def failing_upload(*args, **kwargs):
+                raise IOError("Simulated bulk chunk failure")
+
+            self.server.screen_module.upload = failing_upload
+            try:
+                st_err, _, raw_err = _http_request(
+                    self.port,
+                    "POST",
+                    "/api/screen/upload?filename=test.png",
+                    png_buf.getvalue(),
+                    {"Content-Type": "application/octet-stream"},
+                )
+            finally:
+                self.server.screen_module.upload = orig_upload
+
+            self.assertEqual(st_err, 503)
+            self.assertIn("Simulated bulk chunk failure", json.loads(raw_err)["error"])
+            self.assertTrue(self.backend_closed)
+            self.assertGreaterEqual(reattach_calls, 1)
         finally:
             self.server.kb_factory = orig_kb_factory
             self.disconnected = orig_disconnected
