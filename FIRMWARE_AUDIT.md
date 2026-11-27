@@ -282,11 +282,105 @@ The following three firmware mechanisms exist in `s75pro_fw_v1.03.bin` and **mus
    - **Rule:** Never send `04 38` from host tooling.
 
 2. **EP0 ISP Bootloader Magic Sequence (`AA 42 89 5A FF 71 62 CC` → `FUN_00001924` / `FUN_0000187e` → `FUN_0000014c()`):**
-   - **Effect:** Receiving the 8-byte signature `AA 42 89 5A FF 71 62 CC` on EP0 immediately disables interrupts/peripherals and jumps into the MCU ROM ISP firmware-update bootloader (`FUN_0000014c`).
-   - **Risk:** Drops the keyboard off the normal USB HID bus into raw flash-programming mode; sending malformed data in ISP mode can brick the MCU.
+   - **Effect:** Receiving `0x5A8942AA` / `0xCC6271FF` (`AA 42 89 5A FF 71 62 CC`) in EP0 `FUN_0000187e` (`0x00001894–0x000018D8`) erases/wipes internal MCU flash **`0x00000000–0x000000FF`** (the interrupt vector table!) via `FUN_00001234` (`0x000018AA`), disables interrupts (`0xE000E180`) and peripherals, and jumps to `FUN_0000014c()` (`0x0000014C` → ROM ISP `0x1FFF0301`).
+   - **Risk:** Immediately bricks normal boot off the USB HID bus until valid firmware is reflashed via ISP.
    - **Rule:** Never construct, test, or transmit this magic byte sequence.
 
-3. **Wireless 2.4G OTA / Bootloader Opcodes (`0x7F`, `0x80–0x8F` in `FUN_00005990`):**
-   - **Effect:** Wireless firmware update / bootloader flashing opcodes handled inside the 2.4G receiver command dispatcher.
-   - **Risk:** Malformed RF flashing traffic can brick the keyboard or 2.4G wireless dongle.
+3. **Wireless 2.4G SPI Flash Streamer / OTA Opcodes (`0x7F`, `0x80–0x8F` in `FUN_00005990`):**
+   - **Effect:** `0x7F` (`0x00005D60`) disables IRQ19 LED PWM (`0xE000E180 = 0x80000`) and arms external SPI base `0x00750000` with 24-bit `total_chunks` (`0x200000E0`); `0x80–0x8F` (`0x00005E24`, sent by `DeviceDriver.exe.c` `FUN_00423360`) writes 28-byte chunks via `FUN_000079f2` to **`0x00750000 + 20-bit_idx * 0x1C`** (`0..1,048,575` × `28` B = `29.36 MB`).
+   - **Risk:** Because the external SPI flash helpers send 24-bit addresses (`16 MB` ceiling `0x01000000`), high chunk indices wrap past `0x01000000` onto `0x00000000` factory TFT assets; furthermore, interrupted or malformed RF streaming leaves LED PWM disabled and the display wedged in state `0x0E`.
    - **Rule:** Never construct, expose, or transmit `0x7F` or `0x80–0x8F` as 2.4G command IDs (note: `0x80` as `payload[0]` inside `0x05` is the safe custom-RGB lighting mode selector).
+
+---
+
+## 7. Complete 2.4GHz / UART Command Dispatcher Audit (`FUN_00005990`)
+
+### 7.1 Transport, IRQ ISR & Mode Gating
+- **UART ISR (`0x00013674`, vector `0x00000060 = 0x00013675`):** Reads incoming bytes from UART peripheral `0x40054000` into `0x200026BC` (`34`-byte frame buffer).
+- **Main-loop dispatch (`FUN_00004798`, `0x00004D24–0x00004D46`):** Invokes `FUN_00005990()` at `0x00004D36` **only** when `DAT_200002b7 == 0x22` and `DAT_200000ea == 2` (2.4GHz mode). Bluetooth mode (`DAT_200000ea == 1`) is rejected before `0x00004D36` and has no vendor configuration dispatcher.
+- **Framing check (`FUN_00005990` at `0x00005990`):** Verifies `DAT_200026bc == 0x81` (`-0x7f`) and 8-bit sum `DAT_200026dd == sum(DAT_200026bc[0..32]) & 0xFF`, copies `buf[1..32]` (`[cmd, len, seq, payload[0..28]]`) to `0x200014F5..0x20001514`, mirrors `[cmd, len, seq]` to TX buffer `0x200014D5..0x200014D7`, and sets `DAT_20000150 = 1`.
+
+### 7.2 Complete 16-Opcode Table (`FUN_00005990`)
+
+| Cmd (`DAT_200014f5`) | Ghidra Addr | `DeviceDriver.exe.c` Sender | Firmware Action | Implemented / Safe to Expose? |
+|---|---|---|---|---|
+| `0x02` | `0x00005A3A` | `FUN_0044f980` | Copies 28 B from internal flash `0x00008F80` into reply `0x200014D8..0x200014F3`. | **Implemented (`read_device_info()`)**. |
+| `0x03` | `0x00005A54` | *(unused helper)* | Writes 4 B `payload[0..3]` to Base Keymap `0x00009400 + (seq << 2)` via `FUN_00001e88` and writes `0x55AA0000` (`00 00 AA 55`) at `0x0000963C`. | **Unimplemented; Yes** (safe if host enforces `seq <= 142`). |
+| `0x05` | `0x00005A70` / `0x00005AA4` | `FUN_0042b170`, `FUN_00434900`, `FUN_0044bd70` | If `(payload[0] >> 4) == 2` (`0x20–0x24`): sets underglow mode `DAT_20000194 = payload[0] - 0x20`, calls `FUN_0000e1fc()` + `FUN_0000df18()` (**does not erase `0x00009800`**). Otherwise: writes 16 B to `0x00009800`, applies main effect (`< 0x14`, `0x00`, `0x80`), calls `FUN_0000b000()`, `FUN_0000d9c0()`, `FUN_0000b11a()`, `FUN_0000df18()`. | **Implemented (`set_color()`, `set_underglow_mode()`, `set_custom_lighting()`)**. |
+| `0x07` | `0x00005B46` | `FUN_00414410` | Writes 28 B to General Settings `0x00009000`, updates Win-Lock bit in `0x20000050`, resets `0x200000BD`/`0x200000C3`, calls `FUN_000046d0()`. | **Implemented (`write_general_settings()`)**. |
+| `0x09` | `0x00005BCC` | `FUN_0042db50` | Writes 28 B (`7 × 4 B`) to Macro flash `0x0000A000 + seq * 0x1C` via `FUN_000132fe`, erasing 1 KB page via `FUN_000132d0` when `(offset & 0x3FF) == 0`. | **Unimplemented; Yes with cap** (firmware does not bounds-check `seq`; **host must cap `seq <= 109`**, see §8.3). |
+| `0x0B` | `0x00005C00` | `FUN_00432b00` | Sets `DAT_200000be = 1`, `DAT_200000c0 = 0x32`, renders 15×6 live music EQ via `FUN_00006766` (RAM-only). | **Implemented (`send_wireless_music_eq()`)**. |
+| `0x0C` | `0x00005C60` | `FUN_00423bb0` | Validates `payload[2] == 0x5A`, copies `payload[3..8]` (`yy..SS`) into `0x20000224[0, 1, 3, 4, 5, 6]`, calls `FUN_00008dee()`, sets `DAT_20000239 = 1`, calls `FUN_0000fe96()` (ignores `payload[0..1]`, `weekday`, `AA 55`). | **Implemented (`sync_rtc()`)**. |
+| `0x0D` | `0x00005C8C` | `FUN_00419130` | Writes 4 B `payload[0..3]` to Fn-Layer Keymap `0x0000AC00 + (seq << 2)` via `FUN_00001e88` and writes `0x55AA0000` at `0x0000AE3C`. | **Unimplemented; Yes** (safe if host enforces `seq <= 142`). |
+| `0x0F` | `0x00005CAC` | `FUN_00434ee0` | Calls `FUN_0000de3c()` (`0x0000DE3C`), triggering temporary RAM-only mode `0x1D` self-test blink (zero flash writes). | **Unimplemented; Yes** (harmless visual feedback). |
+| `0x10` | `0x00005CB8` | `FUN_00418df0` (`layer=0`) | Writes 28 B (`7 × 4 B`) to Base Keymap `0x00009400 + seq * 0x1C` (1 KB erase when `(offset & 0x3FF) == 0`). | **Unimplemented; Yes with cap** (host must cap `seq <= 20`, send `len=0x10` / zero `payload[16..27]` on `seq==20`, and include `00 00 AA 55` at `572..575`). |
+| `0x12` | `0x00005CEC` | `FUN_00418df0` (`layer=1`) | Writes 28 B (`7 × 4 B`) to Fn-Layer Keymap `0x0000AC00 + seq * 0x1C` (1 KB erase when `(offset & 0x3FF) == 0`). | **Unimplemented; Yes with cap** (same `seq <= 20` & `00 00 AA 55` guard). |
+| `0x14` | `0x00005D20` | `FUN_0044bd70`, `FUN_004349a0` | Writes 28 B (`7 × 4 B`) to Custom RGB table `0x00009C00 + seq * 0x1C` (1 KB erase when `(offset & 0x3FF) == 0`). | **Implemented (`set_custom_lighting()`, `seq = 0..20`)**. |
+| `0x1F` | `0x00005CB2` | `FUN_00434230` (queue `0x0D` from `FUN_00414600`) | Calls `FUN_00001ece()` (`0x00001ECE`), erasing and zero-filling **only** Base (`0x00009400`) and Fn (`0x0000AC00`) keymap 1 KB pages so custom remaps revert to pass-through (leaves `0x8000`, `0x9000`, `0x9800`, `0x9C00` intact). | **Unimplemented; Yes** (erases user keymaps only; require explicit user action). |
+| `0x20` | `0x00005D54` | `FUN_004357d0` | Returns `DAT_200000f9` (`0–100%` fuel-gauge SOC) in `resp[3]` (`0x200014D8`). | **Implemented (`read_battery_level()`)**. |
+| `0x7F` | `0x00005D60` | `FUN_00423360` | Wireless SPI flash setup (`0x00750000`, `total_chunks`, disables LED PWM `0x80000`, enters state `0x0E`). | **NO / EXCLUDED** (see §6). |
+| `0x80–0x8F` | `0x00005E24` | `FUN_00423360` | `(cmd >> 4) == 8`: writes 28 B chunks to `0x00750000 + 20-bit_idx * 0x1C` via `FUN_000079f2`, draws `"LOADING %"`, calls `FUN_0001047c()` at end. | **NO / EXCLUDED** (24-bit SPI address wrap risk; see §6). |
+
+### 7.3 Internal UART & SPI RF Link Frames (Non-Host)
+- **3-byte UART frames (`FUN_00004798`, `DAT_200002b7 == 3`):** `0x61 0x0D 0x0A` (link idle/ACK clear, `0x00004D0A`), `0x5A <byte>` (`0x00004CFC`), and `0x5B <0x21|0x22|0x23|0x31|0x32|0x33>` (`0x00004CE8`) are internal dongle/radio UART control messages, not exposed over the 32-byte HID pipe.
+- **SPI RF pairing frame (`04 A1 <id_lo> <id_hi>` in `FUN_00005518` → `FUN_000054fc` at `0x000054FC`):** Persists the learned 2-byte RF pairing ID into MCU flash **`0x1FFF0C00`** (**UNSAFE**; internal RF link only).
+
+---
+
+## 8. `0x1304` / `0x1704` Bitfields, On-Board-Only `0x8000` Controls (incl. `0x2000023A` TFT Language) & Bounds Bugs
+
+### 8.1 `0x1304` (`0x00009800`) & `0x1704` (`0x00009000`) Bitfield Completeness
+- **`0x1304` Lighting (`FUN_00003eae` at `0x00003EAE` / `FUN_00005990` at `0x00005AA4`):** Firmware reads only `payload[0]` (`effect`: `< 0x14`, `0x00`, `0x80`, or `0x20–0x24` in `FUN_00003f42`), `payload[1..3]` (`R, G, B`), `payload[8]` (`option`: `0` single-color, `1` multicolor), `payload[9]` (`brightness`: `0..5` mapped by `FUN_0000b000`), `payload[10]` (`speed`: `0..5` mapped by `FUN_0000b11a`), and `payload[11]` (`direction`: `0x01`/`0x02` set `DAT_20000169 = 1`, else `0`). Bytes `4..7` and `12..63` (including `AA 55`) are ignored. Both `0x00` and `0x80` map to internal mode `0x14` (`0x00003F0E–0x00003F18` / `0x00005B08–0x00005B10`).
+- **`0x1704` General Settings (`FUN_00003f42` at `0x00003FD4–0x00004044`):** Packs `0x9000..0x9004` into `hid_ctx[1]` (`0x200000BD`), toggles Win-Lock bit 0 of `0x20000050` when `DAT_2000004d == 0`, and copies `0x9005` (`fn_switch` → `0x200000C3`), `0x9006` (`sleep_time` → `0x200000FA`), and `0x9008` (`key_response_time` → `0x20000052`). Across the entire binary, `0x200000BD` is read **only** in `FUN_00003412` (`0x0000353E`, literal `0x000038EC`) for bit 5 (`0x20`, block `Alt+Tab`) and bit 6 (`0x40`, block `Alt+F4`). Bytes `0x9007` and `0x9009..0x903F` have no firmware consumers.
+
+### 8.2 On-Board-Only `0x8000` Controls (`FUN_0000df18`) & Exhaustive `0x2000023A` TFT Language Audit
+`FUN_0000df18` (`0x0000DF18`, restored at boot by `FUN_0000b086` at `0x0000B086`) writes a 20-byte runtime configuration snapshot (`0x20001823..0x20001836`, tag `0xA5`) to internal flash `0x00008000..0x00008013`. The following controls reside in this snapshot or dedicated RAM globals and have **no USB or 2.4G setter** in `s75pro_fw_v1.03.bin`:
+
+1. **TFT Screen Language (`0x2000023A` = `DAT_2000023a` / `flash[0x800F]`):**
+   - **Firmware proof (`s75pro_fw_v1.03.bin`):** Ghidra `get_xrefs_to("0x2000023a")` returns **37 direct references** across all 6 literal-pool entries (`0x000034C0`, `0x0000B430`, `0x0000DFCC`, `0x0000F1B8`, `0x0000FBE4`, `0x0000FFD8`): **36 `READ`s** and **1 direct `WRITE`** at **`0x0000B0E6`** (`FUN_0000b086` loading `DAT_2000023a = *(uint8_t*)(0x00008000 + 0x0F)` at boot/reset). Exhaustive ARMv6-M Thumb disassembly of every struct-offset and register-indexed store across the 256 KB binary finds **only two indirect writes**: **`0x00011754` and `0x00011772`** (`strb r5/r6, [r7, #6]` relative to `0x20000234`) inside `FUN_000104e0` (`case 0x0B` LCD language menu confirmation, `DAT_20000237 == 8 || 9`), which toggles `DAT_2000023a = (DAT_2000023a == 0)` (`0` = Chinese SPI bitmaps `0x001B18C4`/`0x00172444`/`0x00182164`/`0x0010D044` + `FUN_000127aa` glyphs; `1` = English SPI bitmaps `0x0026629C`/`0x00226E1C`/`0x00236B3C`/`0x002170FC` + `FUN_00012ab6` ASCII text) and calls `FUN_0000df18()` (`0x0001176C`) to persist `DAT_20001832 = DAT_2000023a` to `flash[0x800F]`. Factory reset `FUN_00001d98` (`0x00001D98`) copies template `0x0000700F = 0x00` (Chinese) to `0x0000800F`. Neither wired `FUN_00004622` nor 2.4G `FUN_00005990` can write `0x2000023A`.
+   - **Windows driver cross-check (`DeviceDriver.exe.c`):** Auditing every caller of `HidD_SetFeature` (`FUN_00451350`), `WriteFile` (`FUN_00451130`), and every worker-queue task (`0x01..0x15` in `FUN_00434230`) confirms `DeviceDriver.exe` has **no** TFT screen language packet. On the **Settings (`icon_config.png`) tab** (`FUN_0043b3e0`, `L48606–48613`, adjacent to hardware `0x1704` controls), the Language `MComboBox` (`param_1 + 0x644` / `(LPCWSTR)param_1 + 0x322`, control ID `0x122`, handler `FUN_00414cb0` at `L20123–20130`) controls only the **PC driver GUI's own localization** (`DAT_00594180`, initialized from `config.xml` `<language.info default_lan="...">` at `L26317–26323`), writing Windows Registry `HKCU\<device>\LCID` via `FUN_0040bb60()` (`L12570`) and reloading UI text via `FUN_0043faa0()` with zero USB/2.4G writes. On the **TFT (`icon_tft.png`) tab** (`FUN_0043db10`, `L49738–50462`), the only hardware commands are RTC sync (`0x167` → `FUN_00423a80` `0x2804` / `FUN_00423bb0` `0x0C`, whose `LCDViewList` index at wired `payload[1]` / wireless `payload[0]` is ignored by `0x00003CFC` and `0x00005C60`) and image/GIF upload (`0x16a` → `0x7204` / `0x7F`+`0x80–0x8F`).
+2. **OS Layout Mode (`0x2000004D` / `flash[0x800C]`):** `0`=Windows, `1`=Mac, `2`=iOS, `3`=Android — selected only via `Fn + Q / W / E / R` (`FUN_000029b2`).
+3. **Row-5 Accent Bar (`0x200001DC`):** 5-LED Home/End strip — cycled (`0..10`) only via `Fn + Z` (`FUN_000029b2`).
+4. **Row-6 Underglow Color, Brightness & Speed (`0x20000195`, `0x20000198`, `0x20000196` / `flash[0x8007..0x8009]`):** USB `0x1304` `0x20–0x24` and 2.4G `0x05` `0x20–0x24` set mode `0x20000194` only; color/brightness/speed require on-board `Fn + /?`.
+5. **Knob UI Mode (`0x2000004E` / `flash[0x8010]`) & Active TFT Menu Page (`0x2000023B` / `flash[0x800D]`):** Toggled via `Fn + Knob Press` (`FUN_00002f88`) and on-board TFT menu navigation.
+6. **Full Factory Reset (`FUN_00001d98` at `0x00001D98`):** Triggered only by holding `Fn + Esc` (`FUN_00002f88`, `DAT_20000046 == -0x2e`); restores `0x8000`/`0x8400` from `0x7000`/`0x7400`, zeroes `0x9400`/`0xAC00`, and resets `0x9000` (whereas 2.4G `0x1F` / `FUN_00001ece` only zeroes `0x9400`/`0xAC00`).
+
+### 8.3 Firmware Bounds Bugs Requiring Host-Side Guards
+1. **Wired `0x1504` Macro Write 49-Chunk Off-By-One (`0x00004512` → `0x0000AC00` erase):**
+   - `0x1404` (`0x000044F8`) caps macro reads at `0x30` (`48` chunks = `3,072` B, `0x0000A000–0x0000ABFF`), immediately before the Fn-Layer Keymap page at `0x0000AC00`.
+   - `0x1504` (`0x00004512`) mistakenly passes `max = 0x31` (`49` chunks) to `0x000041C0`. Writing chunk 49 advances the cursor to `0x0000AC00`, where `FUN_00003f42` sees `(0xAC00 & 0x3FF) == 0` and erases the entire `0x0000AC00` Fn-Layer Keymap page via `FUN_000132d0`.
+   - **Host rule:** Never send `chunks > 48` (`0x30`) on `0x1504`.
+2. **Unbounded 2.4G `seq` on `0x09`, `0x10`, `0x12`, `0x14` (`FUN_00005990`):**
+   - None of the 4 wireless chunked flash writers bounds-check `seq` (`DAT_200014f7`), computing `offset = seq * 0x1C` (`0..7,140` B) and erasing any 1 KB boundary (`(offset & 0x3FF) == 0`) past the target partition (`0x9400`, `0x9800`, `0x9C00`, `0xA000`, `0xAC00`, `0xB000+`).
+   - **Host rule:** Enforce `seq <= 109` on `0x09` (`3,052` B `< 3,072` B) and `seq <= 20` (with `len = 0x10` / zeroed `payload[16..27]` on `seq == 20`) on `0x10`, `0x12`, and `0x14`.
+
+---
+
+## 9. Keymap Trailer, Action Encoding & Macro Engine Summary (`FUN_0000275c` / `FUN_00002554`)
+
+- **Enable / Bypass (`0x1804` / `0x1904`):** `0x1804` (`0x000042CC`) clears `hid_ctx[5]` bit 6 (`0x40`) so `FUN_00003412` invokes `FUN_0000275c`; `0x1904` (`0x000042D6`) sets bit 6 for raw-matrix bypass.
+- **Mandatory `0x55AA0000` (`00 00 AA 55`) Trailer at Bytes `572..575`:** Unlike `0x2304` (where `0x0000CBBA` ignores `AA 55`), `FUN_0000275c` checks the full 32-bit word **`*(uint32_t *)0x0000963C == 0x55AA0000`** (`0x000027B4` for Base `0x1104`) and **`*(uint32_t *)0x0000AE3C == 0x55AA0000`** (`0x0000278A` for Fn `0x2704`). Bytes `572..575` (`0x963C–0x963F` / `0xAE3C–0xAE3F`) must therefore be `00 00 AA 55` (matching `DeviceDriver.exe.c` `FUN_00418550`, which places `0x55aa` at offset `574` inside a zeroed `0x30C` buffer), or the entire layer falls back to pass-through.
+- **Slot Lookup & Action `switch8` (`0x000027D6` → `0x0000282E`):** Matrix index (`0..89`) maps via LUT `0x000141C8` to `slot_id` (`<= 0x8F`), reading `[b0, b1, b2, b3]` at `base + (slot_id << 2)`:
+  - `b0 == 0` (`0x00002824` → `0x0000283C`): default pass-through.
+  - `b0 == 1` (`0x00002840`): Mouse button/wheel (`0x20000060` + `0x20000099..`).
+  - `b0 == 2` (`0x00002878`): Standard HID key (`b2`) + modifier mask (`b1`) dispatched via `FUN_00002398`.
+  - `b0 == 3` (`0x0000289C`): Consumer Control 16-bit usage (`b1 | (b2 << 8)` → `DAT_2000007d`/`DAT_2000007e`, pending flag `DAT_20000061 = 1`).
+  - `b0 == 4` (`0x000028B2`): System Control usage (`b1` → `DAT_20000079`, pending flag `DAT_20000062 = 1`).
+  - `b0 == 5` (`0x000028CC`): Special (`b1=1` Fn/layer switch, `b1=2` lighting hotkey, `b1=3` disable key).
+  - `b0 == 6`: Macro trigger (`b1` = macro slot into `0x0000A000 + b1 * 0x100`, `b2` = repeat count or `0xFE` hold-repeat / `0xFF` toggle-repeat, stepped every tick by `FUN_00002554` at `0x00002554`).
+  - `b0 == 7`: Multi-key tap sequence (`b1, b2, b3`). `b0 >= 8`: disabled/no-op.
+- **Pre-interception Priority (`FUN_00003412`):** `FUN_000032d4()`, `FUN_00002f88()`, and `FUN_000029b2()` execute **before** `FUN_0000275c()`, consuming `Fn` (`0xAF`) and hardcoded `Fn` system/mode/lighting combos prior to custom keymap translation.
+
+---
+
+## 10. Rotary Encoder & Knob Press Firmware Audit (`FUN_000021e0` / `FUN_00002f88`)
+
+- **Quadrature Rotation CW / CCW (`FUN_000021e0` at `0x000021E0–0x000022AC`):**
+  - Polls dedicated quadrature GPIO pins (`0x40046000` bit 0 and `0x40044000` bit 3) completely outside the key matrix scanner (`FUN_0000656e`) and never reads `0x00009400` or `0x0000AC00`.
+  - When `DAT_2000004e == 0` (Volume mode): writes hardcoded Consumer usage **`0x00EA`** (`Volume Down`, `0x0000225E`) or **`0x00E9`** (`Volume Up`, `0x0000229C`) to `DAT_2000007d` (`DAT_2000007e = 0`), sets pending flag `DAT_20000061 = 1`, and arms the 10-tick release timer `DAT_2000005e = 10` cleared by `FUN_000022ae` (`0x000022AE–0x000022E2`).
+  - When `DAT_2000004e != 0` (TFT Menu mode): queues UI scroll events `9` / `8` via `FUN_000104b0()`.
+- **Knob Press (`FUN_00002f88` at `0x00002FBC → 0x00003014–0x00003066`):**
+  - Scanned in the key matrix (base table slot `112` → internal keycode `0x98` at `0x00014270 + 0x70 = 0x000142E0`), but unconditionally intercepted in `FUN_00002f88` **before** `FUN_0000275c`:
+    - **`Fn + Knob Press` (`DAT_20000048 != 0`):** Toggles `DAT_2000004e` (`0` ↔ `1`, Volume vs. TFT Menu mode), persists via `FUN_0000df18()`, and triggers LED feedback `FUN_0000e060(0)`.
+    - **Plain Knob Press (`DAT_2000004e == 0`):** Emits hardcoded Consumer **`0x00E2`** (`Mute`, `DAT_20000061 = 1`, `DAT_2000007d = 0xe2`) on press and releases (`0`) on release; when `DAT_2000004e != 0`, queues TFT Menu confirm `0x0C`/`0x0D` (`0x0B` handler).
+- **Conclusion:** Neither rotary encoder rotation (`0x00E9`/`0x00EA`) nor knob press (`0x00E2` / `Fn+Knob`) is remappable via `0x1104` / `0x2704` (consistent with `rgb-keyboard.xml` omitting the knob).

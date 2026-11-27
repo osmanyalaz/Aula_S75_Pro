@@ -44,7 +44,24 @@ Report ID 0; the 64-byte payload follows. hidapi: `send_feature_report(b"\x00" +
 | `0x14` | `0x1C` / `0x10` | `0..20` | 21 chunks (`20 × 28 B` + `1 × 16 B` = `576 B`) | Custom per-key RGB table (sent after `0x05` `effect=0x80`, 2 ms gap). |
 | `0x0B` | `0x1C` | `0` | `[fg_style(0..11), bg_style(0..11), mode, col0..col14(0..6), 0..0]` | **Wireless 15-column × 6-row live music EQ** (`send_wireless_music_eq()`). |
 
-**Wired-only operations (unavailable over 2.4G):** TFT image/GIF upload (`0x7204` / Interface 2), State-1 flash/RAM read-back (`0x0504` raw chunks, `0x1204`, `0x1604`, `0x2204`, `0xF504`), raw 64 B Feature reports, and freeform per-key `0x2004` streaming.
+**Wired-only operations (unavailable over 2.4G):** Safe TFT image/GIF upload (`0x7204` / Interface 2), State-1 flash/RAM read-back (`0x0504` raw chunks, `0x1204`, `0x1404`, `0x1604`, `0x2204`, `0x1004`/`0x2604`, `0xF504`), raw 64 B Feature reports, and freeform per-key `0x2004` streaming.
+
+#### Undocumented / Excluded 2.4G Opcodes (`FUN_00005990`)
+In addition to the 7 opcodes above, [`FUN_00005990`](FIRMWARE_AUDIT.md#7-complete-24ghz--uart-command-dispatcher-audit-fun_00005990) implements 9 opcodes not yet wrapped in `aula_s75pro.py` (or explicitly excluded):
+
+| Cmd | Ghidra Addr | Action Summary | Host Rule / Status |
+|---|---|---|---|
+| `0x03` | `0x00005A54` | Write 4 B slot `payload[0..3]` to Base Keymap `0x9400 + (seq << 2)` + `0x55AA0000` at `0x963C`. | Safe if `seq <= 142`. |
+| `0x09` | `0x00005BCC` | Write 28 B Macro chunk at `0xA000 + seq * 0x1C` (1 KB erase on `(off & 0x3FF) == 0`). | **Host MUST cap `seq <= 109`** (unbounded in FW!). |
+| `0x0D` | `0x00005C8C` | Write 4 B slot `payload[0..3]` to Fn Keymap `0xAC00 + (seq << 2)` + `0x55AA0000` at `0xAE3C`. | Safe if `seq <= 142`. |
+| `0x0F` | `0x00005CAC` | Call `FUN_0000de3c()` — RAM-only temporary mode `0x1D` test blink. | Safe to expose. |
+| `0x10` | `0x00005CB8` | Write 28 B Base Keymap chunk at `0x9400 + seq * 0x1C` (1 KB erase on page boundary). | **Host MUST cap `seq <= 20`** (`len=0x10` on `seq==20`) + `00 00 AA 55`. |
+| `0x12` | `0x00005CEC` | Write 28 B Fn Keymap chunk at `0xAC00 + seq * 0x1C` (1 KB erase on page boundary). | **Host MUST cap `seq <= 20`** (`len=0x10` on `seq==20`) + `00 00 AA 55`. |
+| `0x1F` | `0x00005CB2` | Call `FUN_00001ece()` — erases & zeroes **only** `0x9400` & `0xAC00` keymaps (`0x8000` untouched). | Destructive keymap reset; confirmation required. |
+| `0x7F` | `0x00005D60` | Wireless SPI flash stream setup (`0x00750000`, disables IRQ19 LED PWM `0x80000`, enters state `0x0E`). | **EXCLUDED / UNSAFE** (see §9). |
+| `0x80–0x8F` | `0x00005E24` | Wireless 28 B SPI flash chunk write to `0x00750000 + 20-bit_idx * 0x1C` (`FUN_000079f2`). | **EXCLUDED / UNSAFE** (24-bit SPI wrap; see §9). |
+
+**Host `seq` bounds rule:** None of the 2.4G chunked flash writers (`0x09`, `0x10`, `0x12`, `0x14`) bounds-check `seq` (`buf[3]`) in firmware; sending out-of-range `seq` erases and overwrites neighboring internal flash pages. Always enforce `seq <= 109` on `0x09` and `seq <= 20` on `0x10`, `0x12`, `0x14`. (Full `FUN_00005990` + internal UART/RF link audit: [`FIRMWARE_AUDIT.md`](FIRMWARE_AUDIT.md#7-complete-24ghz--uart-command-dispatcher-audit-fun_00005990).)
 
 ## 2. HID State Machine (`FUN_00004622`), Opcodes & Transaction Model
 
@@ -71,7 +88,7 @@ All EP0 Feature command traffic runs through the main-loop state machine `FUN_00
 | `0x12` | `0x1204` | Valid (`1`) | Flash `0x00009800`, max `1`, `count=chunks+1`, State 1 | **Read Lighting Config page (`0x9800`).** |
 | `0x13` | `0x1304` | **Erases `0x9800`** | Flash `0x00009800`, max `1`, State 2 | Write Lighting Config (`0x00–0x13`, `0x80`) or Row-6 Underglow (`0x20–0x24`, skips flash write). |
 | `0x14` | `0x1404` | Valid (`1`) | Flash `0x0000A000`, max `48`, `count=chunks+1`, State 1 | Read Macros. |
-| `0x15` | `0x1504` | **Erases `0xA000`** | Flash `0x0000A000`, max `49`, State 2 | Write Macros. |
+| `0x15` | `0x1504` | **Erases `0xA000`** | Flash `0x0000A000`, max `49`, State 2 | Write Macros (firmware accepts `49`, **host MUST cap `<= 48`**; chunk 49 erases `0xAC00` Fn keymap). |
 | `0x16` | `0x1604` | Valid (`1`) | Flash `0x00009000`, max `1`, `count=chunks+1`, State 1 | **Read General Settings page (`0x9000`).** |
 | `0x17` | `0x1704` | **Erases `0x9000`** | Flash `0x00009000`, max `1`, State 2 | Write General Settings (`0x00004540` ignores `buf[2..3]` profile index). |
 | `0x18` | `0x1804` | Clears `hid_ctx[5]` bit 6 (`0x40`) | Stays State 0 | Enable custom keymap & macro interception (`FUN_00003412`). |
@@ -114,6 +131,12 @@ All EP0 Feature command traffic runs through the main-loop state machine `FUN_00
 
 **Status-byte semantics:** `resp[3] == 0x01` = well-formed/accepted; `0xFF` = rejected/busy; all-zeros during commit polling can occur transiently during flash housekeeping (especially on RTC / lighting / custom table commits).
 
+### Host-Side Safety Caps, Keymap Trailer & Non-Remappable Controls
+- **`0x1504` macro upload `chunks <= 48` (`0x30`, `3,072 B`) cap:** `0x1504` (`0x00004512`) accepts `max = 49`, but chunk 49 lands on `0x0000AC00`, where `FUN_00003f42` erases the Fn-Layer Keymap 1 KB page via `FUN_000132d0`.
+- **`0x1104` / `0x2704` keymap trailer (`00 00 AA 55` at bytes `572..575`):** `FUN_0000275c` checks `*(uint32_t *)0x0000963C == 0x55AA0000` (`0x000027B4`) and `*(uint32_t *)0x0000AE3C == 0x55AA0000` (`0x0000278A`); without `00 00 AA 55` at offsets `572..575`, the layer is ignored (see [`FIRMWARE_AUDIT.md`](FIRMWARE_AUDIT.md#9-keymap-trailer-action-encoding--macro-engine-summary-fun_0000275c--fun_00002554)).
+- **Non-remappable rotary encoder & knob press:** Quadrature rotation (`FUN_000021e0`) hardcodes Consumer `0x00EA` (`Volume Down`) / `0x00E9` (`Volume Up`), and Knob Press (`FUN_00002f88`) hardcodes `0x00E2` (`Mute`) / `Fn+Knob` TFT UI toggle before `FUN_0000275c` runs (see [`FIRMWARE_AUDIT.md`](FIRMWARE_AUDIT.md#10-rotary-encoder--knob-press-firmware-audit-fun_000021e0--fun_00002f88)).
+- **On-board-only `0x8000` settings (`FUN_0000df18`):** TFT screen language (`0x2000023A` / `flash[0x800F]`, toggled **only** on the keyboard's TFT LCD menu at `0x00011754`/`0x00011772` inside `FUN_000104e0` — `DeviceDriver.exe`'s Settings-tab Language `MComboBox` `0x644` / ID `0x122` only sets Windows Registry `HKCU\<device>\LCID` for its own PC GUI), OS mode (`0x2000004D`, `Fn+Q/W/E/R`), Row-5 accent bar (`0x200001DC`, `Fn+Z`), underglow color/brightness/speed (`0x20000195`/`198`/`196`, `Fn+/?`), knob UI mode (`0x2000004E`), and `Fn+Esc` full factory reset (`FUN_00001d98`) have no USB/2.4G setter (see [`FIRMWARE_AUDIT.md`](FIRMWARE_AUDIT.md#8-0x1304--0x1704-bitfields-on-board-only-0x8000-controls-incl-0x2000023a-tft-language--bounds-bugs)).
+
 ## 3. Lighting effects (0x1304 page)
 
 Write payload (64 bytes): `[effect, r, g, b, 0,0,0,0, option, brightness, speed,
@@ -123,12 +146,8 @@ rotating, explode, launch, ripples, flowing, pulsating, tilt, shuttle. Verified
 against per-effect captures.
 
 Quirks:
-- **Effect byte `0x00` reloads the stored config from flash** — the board re-runs the
-  saved effect. It is NOT "custom mode".
-- Effect byte `0x14` is rejected by the dispatcher (not `< 0x14`) — a silent no-op.
-- Internal mode `0x14` (= factory default, "custom light") is selected by host bytes
-  `0x00`/`0x80` per the firmware's command-5 mapping, but see the note above — from
-  the USB side, `0x00` behaves as reload-stored.
+- In wired `0x1304` (`0x00003F0E–0x00003F18`) and 2.4G `0x05` (`0x00005B08–0x00005B10`), both `0x00` and `0x80` select internal mode `0x14`: a zeroed `0x00` payload (`payload[1..13] == 0`) sets brightness `0` (`FUN_0000b000`) and turns main-key LEDs off (so do not treat `0x00` as a flash reload shortcut — to restore saved USB lighting, read `0x9800` via `0x1204` and rewrite it via `0x1304`), whereas `0x80` with `brightness > 0` renders the `0x9C00` custom per-key RGB table.
+- Any `effect >= 0x14` outside `0x80` and Row-6 underglow `0x20–0x24` is ignored by the renderer (`FUN_00003eae` at `0x00003EAE`).
 
 ### Effect IDs and Modifiers
 
@@ -329,6 +348,6 @@ to ensure the MCU animation pointers and flash buffers latch cleanly:
 
 ### Explicit Safety Exclusions (DO NOT IMPLEMENT OR EXPOSE)
 - **Opcode `0x3804` (`04 38`, `0x0000459E` → State 5):** Writes `EP 3 OUT` 4096 B chunks to external SPI flash starting at **`0x00000000`**, overwriting factory TFT splash screens, menus, icons, and language tables (`0x00172444`, `0x00182164`, `0x00236B3C`).
-- **EP0 ISP Bootloader Magic (`AA 42 89 5A FF 71 62 CC` → `FUN_00001924` / `FUN_0000187e` → `FUN_0000014c()`):** Immediately disables interrupts/peripherals and jumps into the MCU ROM ISP bootloader; malformed writes can brick the keyboard.
-- **Wireless OTA / Bootloader Opcodes (`0x7F`, `0x80–0x8F` in `FUN_00005990`):** Wireless firmware flashing path; excluded to avoid bricking the dongle/keyboard over RF.
-- **Safe idioms:** `0x2004` streaming writes RAM only (zero flash wear); keep flash-writing commands (`0x11`, `0x13`, `0x15`, `0x17`, `0x23`, `0x27`) for occasional config updates and `0x7204` (`0x00750000` only) within the `140`-frame / `32–510 ms` bounds.
+- **EP0 ISP Bootloader Magic (`AA 42 89 5A FF 71 62 CC` → `FUN_00001924` / `FUN_0000187e` → `FUN_0000014c()`):** `FUN_0000187e` (`0x00001894–0x000018D8`) erases/wipes internal MCU flash `0x00000000–0x000000FF` via `FUN_00001234` (`0x000018AA`), disables interrupts/peripherals, and jumps into `FUN_0000014c()` (MCU ROM ISP bootloader); malformed writes can brick the keyboard.
+- **Wireless OTA / Bootloader Opcodes (`0x7F`, `0x80–0x8F` in `FUN_00005990`):** Wireless OTA path — `0x7F` (`0x00005D60`) disables LED PWM (`0xE000E180 = 0x80000`) and `0x80–0x8F` (`0x00005E24`) writes 28 B chunks to `0x00750000 + 20-bit_idx * 0x1C` via `FUN_000079f2`, wrapping 24-bit `16 MB` SPI flash onto `0x00000000` factory TFT assets; excluded to avoid bricking the dongle/keyboard over RF.
+- **Safe idioms:** `0x2004` streaming writes RAM only (zero flash wear); keep flash-writing commands (`0x11`, `0x13`, `0x15`, `0x17`, `0x23`, `0x27`) for occasional config updates, enforce `0x1504 <= 48` chunks, `00 00 AA 55` at bytes `572..575` on `0x1104`/`0x2704`, bounded 2.4G `seq` (`0..109` on `0x09`; `0..20` on `0x10`/`0x12`/`0x14`), and `0x7204` (`0x00750000` only) within the `140`-frame / `32–510 ms` bounds.

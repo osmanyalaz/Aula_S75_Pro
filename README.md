@@ -71,9 +71,10 @@ See [PROTOCOL.md](PROTOCOL.md) for the full reverse-engineered protocol, and [FI
   - System temperature / CPU-load monitor
   - Notification / alert blinker
 - **Remaining protocol features (low priority / optional):**
-  - Macros and keymap remapping (`0x1104` / `0x2704`)
-  - *(Note: `0x3804` full SPI flash write, the EP0 ISP bootloader magic sequence, and wireless 2.4G OTA opcodes `0x7F` / `0x80–0x8F` remain intentionally excluded for safety.)*
+  - Macros (`0x1404` / `0x1504` capped at `<= 48` chunks wired, `0x09` over 2.4G) and keymap remapping (`0x1004`/`0x1104` base & `0x2604`/`0x2704` Fn-layer with `00 00 AA 55` trailer at bytes `572..575`, `0x1904` bypass, and 2.4G `0x03`/`0x0D`/`0x10`/`0x12`/`0x1F`)
+  - Optional 2.4G `0x0F` temporary test-blink helper (`FUN_0000de3c`, RAM-only)
+  - *(On-board-only hardware controls in firmware `v1.03`: rotary encoder CW/CCW/press `0x00E9`/`0x00EA`/`0x00E2`, TFT screen language `0x2000023A` toggled on the keyboard LCD menu — `DeviceDriver.exe`'s Settings language dropdown only sets its own PC GUI `LCID`, OS layout mode `Fn+Q/W/E/R`, Row-5 accent bar `Fn+Z`, underglow static/breathing color `Fn+/?`, and full `Fn+Esc` factory reset have no USB/2.4G setter; `0x3804` full SPI flash write, the EP0 ISP bootloader magic sequence, and wireless `0x7F` / `0x80–0x8F` SPI streaming remain intentionally excluded for safety.)*
 
 ## Credits
 Reverse-engineered from USB captures of the official driver, its decompilation,
-the keyboard MCU firmware.
+and the keyboard MCU firmware.
