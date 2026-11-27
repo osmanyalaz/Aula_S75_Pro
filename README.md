@@ -72,7 +72,6 @@ See [PROTOCOL.md](PROTOCOL.md) for the full reverse-engineered protocol, and [FI
   - Notification / alert blinker
 - **Remaining protocol features (low priority / optional):**
   - Macros and keymap remapping (`0x1104` / `0x2704`)
-  - Factory reset and TFT/keyboard language selection
   - *(Note: `0x3804` full SPI flash write, the EP0 ISP bootloader magic sequence, and wireless 2.4G OTA opcodes `0x7F` / `0x80–0x8F` remain intentionally excluded for safety.)*
 
 ## Credits
