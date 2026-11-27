@@ -8,7 +8,7 @@ lighting effects, per-key RGB streaming (RAM-only, ~28 fps wired; 15×6 music EQ
 > - **Unofficial project:** This is an independent, community reverse-engineered tool not affiliated with or endorsed by AULA, EPOMAKER, or SONiX. Provided "as is" without warranty (see [LICENSE.md](LICENSE.md)); use at your own risk.
 > - **Raw commands (`cli.py raw-send`):** Sends arbitrary 64-byte HID Feature reports directly to the MCU. Never send unverified opcodes or the excluded commands documented in [PROTOCOL.md](PROTOCOL.md#explicit-safety-exclusions-do-not-implement-or-expose) and [FIRMWARE_AUDIT.md](FIRMWARE_AUDIT.md#6-explicit-safety-exclusions-do-not-implement) (`0x3804`, the EP0 ISP bootloader magic, and wireless `0x7F`/`0x80–0x8F`).
 > - **Flash wear:** `color`, `custom`, `underglow`, `set-key-response`, `set-sleep-time`, and TFT screen uploads (`screenUpload/aula_s75pro_screen.py`) write to internal MCU flash or external SPI flash — avoid calling them in tight loops. Use RAM-only `AulaStreamer` (`0x2004`, wired USB) or `send_wireless_music_eq()` (`0x0B`, 2.4G) for continuous animations.
-
+> **Built with AI assistance for Ghidra analysis, implementation, and code auditing**
 ## Connection modes (`--mode auto|usb|dongle`)
 - **Auto (CLI default `--mode auto`):** Prefers wired USB (`0x0C45:0x800A`), falls back to the 2.4GHz wireless dongle (`0x05AC:0x024F` `"2.4G Dongle"`, Interface 3; `0x0C45:0xFEFE` fallback).
 - **Wired USB (`--mode usb`):** Full feature set including flash/RAM read-back (`read ...`), `raw-send`/`raw-get`, `0x2004` freeform per-key streaming (`AulaStreamer`), and TFT image/GIF/video upload (`screenUpload/aula_s75pro_screen.py`).
