@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AULA S75 Pro — Local Control</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="status-bar card">
+      <div class="brand-group">
+        <h1>AULA S75 Pro</h1>
+        <span class="subtitle">Local Control &amp; Screen Studio</span>
+      </div>
+      <div class="status-pills">
+        <span id="conn-badge" class="pill pill-offline">Checking…</span>
+        <span id="device-id-badge" class="pill pill-muted">VID:PID —</span>
+        <span id="fw-badge" class="pill pill-muted">FW —</span>
+        <div class="battery-pill" title="Keyboard battery status">
+          <div class="battery-bar-wrap">
+            <div id="battery-bar" class="battery-bar" style="width: 0%"></div>
+          </div>
+          <span id="battery-text">—</span>
+        </div>
+        <button id="btn-refresh" class="btn btn-secondary" type="button" title="Re-query keyboard status">
+          Refresh
+        </button>
+      </div>
+    </header>
+
+    <div id="conn-error-banner" class="banner banner-warn hidden"></div>
+
+    <section class="card keyboard-card">
+      <div class="section-head">
+        <div>
+          <h2>Keyboard Map <span class="muted-small">(80 physical keys · drag to paint, right-click to clear)</span></h2>
+        </div>
+        <div class="section-actions">
+          <span id="active-paint-badge" class="pill pill-muted">Brush: #FF3B30</span>
+        </div>
+      </div>
+      <div id="keyboard-viewport" class="keyboard-viewport">
+        <div id="keyboard-stage" class="keyboard-stage" aria-label="AULA S75 Pro interactive layout">
+          <div class="keyboard-loading">Loading keyboard layout…</div>
+        </div>
+      </div>
+    </section>
+
+    <nav class="tab-bar" role="tablist">
+      <button class="tab-btn active" data-tab="per-key" type="button" role="tab" aria-selected="true">Per-Key RGB</button>
+      <button class="tab-btn" data-tab="lighting" type="button" role="tab" aria-selected="false">Lighting &amp; Underglow</button>
+      <button class="tab-btn" data-tab="settings" type="button" role="tab" aria-selected="false">Settings &amp; Clock</button>
+      <button class="tab-btn" data-tab="screen" type="button" role="tab" aria-selected="false">TFT Screen (135×240)</button>
+    </nav>
+
+    <main class="panels-wrap">
+      <!-- Per-Key RGB Panel -->
+      <section id="panel-per-key" class="card panel active" role="tabpanel">
+        <div class="panel-grid">
+          <div class="control-block">
+            <h3>Brush &amp; Palette</h3>
+            <div class="row-inline">
+              <input id="key-color-picker" type="color" value="#ff3b30" aria-label="Key brush color">
+              <input id="key-color-hex" class="hex-input" type="text" value="#FF3B30" maxlength="7" aria-label="Key brush hex">
+              <button id="btn-tool-paint" class="btn btn-chip active" type="button">Paint</button>
+              <button id="btn-tool-erase" class="btn btn-chip" type="button">Eraser</button>
+            </div>
+            <div class="swatches" id="key-swatches">
+              <button class="swatch" data-hex="#FF3B30" style="background:#FF3B30" type="button" title="Red"></button>
+              <button class="swatch" data-hex="#FF9500" style="background:#FF9500" type="button" title="Orange"></button>
+              <button class="swatch" data-hex="#FFCC00" style="background:#FFCC00" type="button" title="Amber"></button>
+              <button class="swatch" data-hex="#34C759" style="background:#34C759" type="button" title="Green"></button>
+              <button class="swatch" data-hex="#00C7BE" style="background:#00C7BE" type="button" title="Cyan"></button>
+              <button class="swatch" data-hex="#0A84FF" style="background:#0A84FF" type="button" title="Blue"></button>
+              <button class="swatch" data-hex="#AF52DE" style="background:#AF52DE" type="button" title="Purple"></button>
+              <button class="swatch" data-hex="#FFFFFF" style="background:#FFFFFF" type="button" title="White"></button>
+            </div>
+            <label class="range-row">
+              <span>Custom Brightness: <strong id="custom-bri-val">5</strong></span>
+              <input id="custom-brightness" type="range" min="0" max="5" step="1" value="5">
+            </label>
+          </div>
+
+          <div class="control-block">
+            <h3>Table Actions</h3>
+            <p class="hint">Click or drag across keys above to paint individual RGB LEDs. Works over both wired USB and 2.4GHz dongle (reads require wired USB).</p>
+            <div class="btn-group">
+              <button id="btn-fill-all" class="btn btn-secondary" type="button">Fill All</button>
+              <button id="btn-clear-all" class="btn btn-secondary" type="button">Clear All</button>
+              <button id="btn-load-custom" class="btn btn-secondary wired-only-read" type="button">Load from Keyboard</button>
+              <button id="btn-save-custom" class="btn btn-primary" type="button">Save to Keyboard</button>
+            </div>
+            <div id="perkey-info" class="meta-line muted-small">0 / 80 keys lit</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Global Lighting & Underglow Panel -->
+      <section id="panel-lighting" class="card panel" role="tabpanel">
+        <div class="panel-grid">
+          <div class="control-block">
+            <h3>Main-Key Global Effect</h3>
+            <div class="form-grid">
+              <label>
+                <span>Effect</span>
+                <select id="light-effect"></select>
+              </label>
+              <label>
+                <span>Color Mode (option)</span>
+                <select id="light-option">
+                  <option value="0">0 — Solid RGB</option>
+                  <option value="1">1 — Hardware Multi-Color / Rainbow</option>
+                </select>
+              </label>
+            </div>
+            <p id="light-effect-note" class="hint"></p>
+
+            <div class="row-inline">
+              <input id="light-color-picker" type="color" value="#00c7be" aria-label="Global RGB color">
+              <input id="light-color-hex" class="hex-input" type="text" value="#00C7BE" maxlength="7" aria-label="Global RGB hex">
+            </div>
+
+            <label class="range-row">
+              <span>Brightness: <strong id="light-bri-val">5</strong></span>
+              <input id="light-brightness" type="range" min="0" max="5" step="1" value="5">
+            </label>
+            <label class="range-row">
+              <span>Speed: <strong id="light-spd-val">3</strong></span>
+              <input id="light-speed" type="range" min="0" max="5" step="1" value="3">
+            </label>
+            <label class="range-row">
+              <span>Direction: <strong id="light-dir-val">0 (Right/Down)</strong></span>
+              <input id="light-direction" type="range" min="0" max="2" step="1" value="0">
+            </label>
+
+            <div class="btn-group">
+              <button id="btn-load-lighting" class="btn btn-secondary wired-only-read" type="button">Load Current</button>
+              <button id="btn-apply-lighting" class="btn btn-primary" type="button">Apply Lighting</button>
+            </div>
+          </div>
+
+          <div class="control-block">
+            <h3>Row-6 Side / Underglow</h3>
+            <p class="hint">
+              Firmware ignores RGB, brightness, and speed bytes for Row-6 underglow.
+              To change the static underglow color, cycle presets directly on the keyboard with <strong>Fn + /?</strong>.
+            </p>
+            <div id="underglow-buttons" class="btn-group">
+              <button class="btn btn-secondary underglow-btn" data-mode="flowing" type="button">Flowing (0)</button>
+              <button class="btn btn-secondary underglow-btn" data-mode="spectrum" type="button">Spectrum (1)</button>
+              <button class="btn btn-secondary underglow-btn" data-mode="static" type="button">Static (2)</button>
+              <button class="btn btn-secondary underglow-btn" data-mode="breathing" type="button">Breathing (3)</button>
+              <button class="btn btn-secondary underglow-btn" data-mode="off" type="button">Off (4)</button>
+            </div>
+            <label class="checkbox-row">
+              <input id="ug-preserve" type="checkbox" checked>
+              <span>Preserve main-key lighting (wired <code>0x9800</code> save &amp; restore)</span>
+            </label>
+          </div>
+        </div>
+      </section>
+
+      <!-- Settings & Clock Panel -->
+      <section id="panel-settings" class="card panel" role="tabpanel">
+        <div class="panel-grid">
+          <div class="control-block">
+            <h3>General Keyboard Settings</h3>
+            <div class="form-grid">
+              <label>
+                <span>Key Response Time (Debounce)</span>
+                <select id="set-key-resp">
+                  <option value="1">1 — Fastest (2 scans)</option>
+                  <option value="2" selected>2 — Fast (3 scans, default)</option>
+                  <option value="3">3 — Medium (7 scans)</option>
+                  <option value="4">4 — Relaxed (10 scans)</option>
+                  <option value="5">5 — Slow (14 scans)</option>
+                </select>
+              </label>
+              <label>
+                <span>Wireless / LED Sleep Timeout</span>
+                <select id="set-sleep-time">
+                  <option value="0">0 — Off (never sleep)</option>
+                  <option value="1">1 — 1 minute</option>
+                  <option value="2">2 — 5 minutes</option>
+                  <option value="3">3 — 30 minutes</option>
+                </select>
+              </label>
+            </div>
+            <div class="checks-grid">
+              <label class="checkbox-row">
+                <input id="set-fn-switch" type="checkbox">
+                <span>Sticky Fn toggle (<code>fn_switch</code>)</span>
+              </label>
+              <label class="checkbox-row">
+                <input id="set-win-lock" type="checkbox">
+                <span>Win-Lock (disable Windows key)</span>
+              </label>
+              <label class="checkbox-row">
+                <input id="set-alt-tab" type="checkbox">
+                <span>Disable Alt+Tab</span>
+              </label>
+              <label class="checkbox-row">
+                <input id="set-alt-f4" type="checkbox">
+                <span>Disable Alt+F4</span>
+              </label>
+            </div>
+            <div class="btn-group">
+              <button id="btn-load-settings" class="btn btn-secondary wired-only-read" type="button">Load Current</button>
+              <button id="btn-apply-settings" class="btn btn-primary" type="button">Apply Settings</button>
+            </div>
+          </div>
+
+          <div class="control-block">
+            <h3>TFT Real-Time Clock (RTC)</h3>
+            <p class="hint">Synchronize the keyboard's on-board TFT clock to your computer's local time. Works in both wired USB and 2.4GHz modes.</p>
+            <div class="clock-box">
+              <div class="muted-small">Local System Time</div>
+              <div id="local-clock-display" class="clock-readout">--:--:--</div>
+            </div>
+            <div class="btn-group">
+              <button id="btn-sync-clock" class="btn btn-primary" type="button">Sync Keyboard Clock</button>
+            </div>
+            <div id="sync-clock-result" class="meta-line muted-small"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TFT Screen Panel -->
+      <section id="panel-screen" class="card panel" role="tabpanel">
+        <div id="screen-dongle-banner" class="banner banner-warn hidden">
+          2.4GHz wireless dongle active: TFT image/GIF/video uploads (<code>0x7204</code> / Interface 2 SPI pipe) require a <strong>wired USB</strong> connection. Offline 135×240 preview remains available.
+        </div>
+        <div class="screen-grid">
+          <div class="control-block">
+            <h3>Media Upload (PNG, JPG, GIF, MP4)</h3>
+            <div id="dropzone" class="dropzone" tabindex="0">
+              <input id="screen-file-input" type="file" accept=".png,.jpg,.jpeg,.webp,.bmp,.gif,.mp4,.mov,.webm,.mkv,.avi,.m4v" hidden>
+              <div class="dropzone-title">Drop an image, GIF, or video here</div>
+              <div class="muted-small">or click to browse · resized to hardware portrait 135×240 (max 140 frames, 25 MiB)</div>
+              <div id="selected-filename" class="pill pill-muted hidden"></div>
+            </div>
+
+            <div class="form-grid">
+              <label>
+                <span>Delay Override (ms, 32–510)</span>
+                <input id="screen-delay" type="number" min="32" max="510" step="2" placeholder="Auto (GIF/video)">
+              </label>
+              <label>
+                <span>Video FPS (optional)</span>
+                <input id="screen-fps" type="number" min="1" max="60" step="1" placeholder="Auto">
+              </label>
+              <label>
+                <span>Max Frames (1–140)</span>
+                <input id="screen-max-frames" type="number" min="1" max="140" step="1" placeholder="140 max">
+              </label>
+              <label class="checkbox-row align-bottom">
+                <input id="screen-fit" type="checkbox">
+                <span>Fit / letterbox instead of stretch</span>
+              </label>
+            </div>
+
+            <div class="btn-group">
+              <button id="btn-preview-screen" class="btn btn-secondary" type="button" disabled>Refresh Preview</button>
+              <button id="btn-upload-screen" class="btn btn-primary" type="button" disabled>Upload to Keyboard Screen</button>
+            </div>
+          </div>
+
+          <div class="control-block preview-col">
+            <h3>Hardware Preview (135 × 240)</h3>
+            <div class="preview-layout">
+              <div class="tft-bezel">
+                <img id="screen-preview-img" class="tft-preview-img hidden" alt="TFT screen preview">
+                <div id="screen-preview-empty" class="tft-preview-empty">135×240<br>No Media</div>
+              </div>
+              <dl class="stats-list">
+                <div><dt>Resolution</dt><dd id="stat-res">135 × 240</dd></div>
+                <div><dt>Frames</dt><dd id="stat-frames">—</dd></div>
+                <div><dt>4 KB Chunks</dt><dd id="stat-chunks">—</dd></div>
+                <div><dt>SPI Payload</dt><dd id="stat-bytes">—</dd></div>
+                <div><dt>Delays (ms)</dt><dd id="stat-delays">—</dd></div>
+                <div><dt>Est. Upload</dt><dd id="stat-eta">—</dd></div>
+              </dl>
+            </div>
+            <div id="stat-truncated" class="banner banner-info hidden">
+              Source exceeded 140-frame SPI flash limit and was truncated cleanly to 140 frames.
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+  </div>
+
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

@@ -979,6 +979,70 @@ class ScreenUploaderTests(unittest.TestCase):
                 screen.PyUsbBackend()
         self.assertIn("Keyboard not found", str(ctx2.exception))
 
+    def test_pyusb_backend_close_releases_interfaces_before_reattach_and_disposes(self):
+        import types
+        import warnings
+
+        events = []
+        claimed = {2, 3}
+        disposed = []
+
+        class FakeCtx:
+            @property
+            def managed_interfaces(self):
+                return set(claimed)
+
+        class FakeUsbDevice:
+            def __init__(self):
+                self._ctx = FakeCtx()
+
+            def attach_kernel_driver(self, iface):
+                if iface in claimed:
+                    raise OSError(f"Resource busy: interface {iface} still claimed")
+                events.append(("attach", iface))
+
+        fake_usb_dev = FakeUsbDevice()
+
+        def fake_release_interface(dev, iface):
+            events.append(("release", iface))
+            claimed.discard(iface)
+
+        def fake_dispose_resources(dev):
+            events.append(("dispose", dev))
+            disposed.append(dev)
+
+        fake_usb_util = types.SimpleNamespace(
+            release_interface=fake_release_interface,
+            dispose_resources=fake_dispose_resources,
+        )
+        fake_usb_core = types.SimpleNamespace(
+            find=lambda idVendor=None, idProduct=None: fake_usb_dev
+        )
+        fake_usb_pkg = types.SimpleNamespace(core=fake_usb_core, util=fake_usb_util)
+
+        with mock.patch.dict(
+            sys.modules,
+            {"usb": fake_usb_pkg, "usb.core": fake_usb_core, "usb.util": fake_usb_util},
+        ):
+            backend = screen.PyUsbBackend()
+            backend._detached = [2, 3]
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                backend.close()
+
+        self.assertEqual(caught, [])
+        self.assertEqual(claimed, set())
+        self.assertEqual(backend._detached, [])
+        self.assertEqual(disposed, [fake_usb_dev])
+        # Verify release happens before attach, and dispose happens last
+        release_indices = [i for i, (op, _) in enumerate(events) if op == "release"]
+        attach_indices = [i for i, (op, _) in enumerate(events) if op == "attach"]
+        dispose_idx = next(i for i, (op, _) in enumerate(events) if op == "dispose")
+        self.assertEqual([events[i] for i in release_indices], [("release", 2), ("release", 3)])
+        self.assertEqual([events[i] for i in attach_indices], [("attach", 2), ("attach", 3)])
+        self.assertLess(max(release_indices), min(attach_indices))
+        self.assertLess(max(attach_indices), dispose_idx)
+
 
 class DongleProtocolTests(unittest.TestCase):
     def setUp(self):

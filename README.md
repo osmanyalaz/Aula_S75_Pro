@@ -47,6 +47,15 @@ Reload rules:
 
     sudo udevadm control --reload && sudo udevadm trigger
 
+## Local WebUI
+Start the zero-dependency offline WebUI (binds strictly to `127.0.0.1`):
+
+    python cli.py web                 # starts on http://127.0.0.1:8765 and opens browser
+    python cli.py web --port 9000 --no-open
+    python cli.py --mode dongle web   # force 2.4GHz dongle mode
+
+Features include interactive 80-key per-key RGB painting (`keyboard-layout.json` + `keymap.py`), global lighting effects & underglow, general settings + RTC clock sync, and 135×240 portrait TFT image/GIF/video preview & wired upload. Flash/RAM read-back and TFT screen uploads require a wired USB connection.
+
 ## Docs
 See [PROTOCOL.md](PROTOCOL.md) for the full reverse-engineered protocol, and [FIRMWARE_AUDIT.md](FIRMWARE_AUDIT.md) for firmware verification details and safety exclusions.
 

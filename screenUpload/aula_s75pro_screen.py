@@ -585,11 +585,35 @@ class PyUsbBackend:
         return bytes(self._usb.read(EP_IN, 64, timeout=3000))
 
     def close(self):
+        import usb.util
+
+        if self._usb is None:
+            self._detached = []
+            return
+
+        ctx = getattr(self._usb, "_ctx", None)
+        claimed = set(getattr(ctx, "managed_interfaces", ()) or ())
+        for n in sorted(set(self._detached) | claimed | {HID_IFACE}):
+            try:
+                usb.util.release_interface(self._usb, n)
+            except Exception:
+                pass
+
         for n in self._detached:
             try:
                 self._usb.attach_kernel_driver(n)
-            except Exception:
-                pass
+            except Exception as exc:
+                warnings.warn(
+                    f"Failed to re-attach kernel driver on interface {n}: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+
+        try:
+            usb.util.dispose_resources(self._usb)
+        except Exception:
+            pass
+        self._detached = []
 
     # def _detach_kernel_drivers(self) -> list:
     #     """

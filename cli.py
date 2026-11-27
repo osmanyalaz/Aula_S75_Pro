@@ -358,6 +358,12 @@ def cmd_sync_clock(args):
         kb.sync_rtc()
     print("Keyboard RTC synced to PC time")
 
+
+def cmd_web(args):
+    from webui.server import run_server
+
+    run_server(port=args.port, mode=args.mode, open_browser=not args.no_open)
+
 def main():
     p = argparse.ArgumentParser(description="Aula S75Pro reverse-engineered control tool")
     p.add_argument(
@@ -493,6 +499,20 @@ def main():
 
 
     sub.add_parser("sync-clock", help="sync keyboard RTC to PC time").set_defaults(func=cmd_sync_clock)
+
+    sp_web = sub.add_parser("web", help="start local WebUI server on 127.0.0.1")
+    sp_web.add_argument(
+        "--port",
+        type=int,
+        default=8765,
+        help="local TCP port on 127.0.0.1 (default: 8765)",
+    )
+    sp_web.add_argument(
+        "--no-open",
+        action="store_true",
+        help="do not automatically open the browser",
+    )
+    sp_web.set_defaults(func=cmd_web)
 
 
     args = p.parse_args()
