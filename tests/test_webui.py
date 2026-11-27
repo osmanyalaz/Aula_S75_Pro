@@ -481,6 +481,58 @@ class WebUiWiredApiTests(unittest.TestCase):
         st_503, _, _ = _http_request(self.port, "POST", "/api/sync-clock", {})
         self.assertEqual(st_503, 503)
 
+    def test_post_host_and_origin_validation(self):
+        # Allowed same-origin POSTs (127.0.0.1 and localhost matching server port)
+        for host, origin in (
+            (f"127.0.0.1:{self.port}", f"http://127.0.0.1:{self.port}"),
+            (f"localhost:{self.port}", f"http://localhost:{self.port}"),
+            (f"LOCALHOST:{self.port}", f"HTTP://LOCALHOST:{self.port}/"),
+        ):
+            st_ok, _, raw_ok = _http_request(
+                self.port,
+                "POST",
+                "/api/sync-clock",
+                {},
+                {"Host": host, "Origin": origin},
+            )
+            self.assertEqual(st_ok, 200, f"Expected 200 for Host={host!r}, Origin={origin!r}")
+            self.assertTrue(json.loads(raw_ok)["ok"])
+
+        # Cross-origin / DNS-rebinding / port-mismatched POSTs must be rejected with 403
+        # without invoking hardware.
+        with mock.patch.object(self.server, "kb_factory", side_effect=AssertionError("hardware touched!")):
+            for bad_headers in (
+                {"Host": f"evil.example:{self.port}"},
+                {"Host": f"127.0.0.1:{self.port + 1}"},
+                {"Host": "127.0.0.1"},
+                {"Host": f"127.0.0.1:{self.port}", "Origin": "https://evil.example"},
+                {"Host": f"127.0.0.1:{self.port}", "Origin": f"http://127.0.0.1:{self.port + 1}"},
+                {"Host": f"127.0.0.1:{self.port}", "Origin": "null"},
+                {"Host": f"127.0.0.1:{self.port}", "Origin": ""},
+            ):
+                st_403, _, raw_err = _http_request(
+                    self.port,
+                    "POST",
+                    "/api/sync-clock",
+                    {},
+                    bad_headers,
+                )
+                self.assertEqual(st_403, 403, f"Expected 403 for headers={bad_headers!r}")
+                self.assertIn("error", json.loads(raw_err))
+
+            # Missing Host header (raw HTTP/1.0-style request without Host)
+            conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+            try:
+                conn.putrequest("POST", "/api/sync-clock", skip_host=True)
+                conn.putheader("Content-Length", "2")
+                conn.endheaders(b"{}")
+                resp = conn.getresponse()
+                err_body = json.loads(resp.read())
+                self.assertEqual(resp.status, 403)
+                self.assertIn("error", err_body)
+            finally:
+                conn.close()
+
 
 class WebUiDongleApiTests(unittest.TestCase):
     def setUp(self):

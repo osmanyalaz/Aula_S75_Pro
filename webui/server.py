@@ -584,10 +584,37 @@ class AulaRequestHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
 
+    def _allowed_loopback_hosts(self) -> set[str]:
+        port = self.server.server_address[1]
+        hosts = {f"{DEFAULT_HOST}:{port}", f"localhost:{port}"}
+        if port == 80:
+            hosts.update({DEFAULT_HOST, "localhost"})
+        return hosts
+
+    def _validate_post_host_and_origin(self) -> None:
+        allowed_hosts = self._allowed_loopback_hosts()
+        host_hdr = (self.headers.get("Host") or "").strip().lower()
+        if host_hdr not in allowed_hosts:
+            raise _HttpMappedError(
+                HTTPStatus.FORBIDDEN,
+                f"Rejected Host header for POST request: {host_hdr or '<missing>'}",
+            )
+
+        origin_hdr = self.headers.get("Origin")
+        if origin_hdr is not None:
+            origin_clean = origin_hdr.strip().rstrip("/").lower()
+            allowed_origins = {f"http://{h}" for h in allowed_hosts}
+            if origin_clean not in allowed_origins:
+                raise _HttpMappedError(
+                    HTTPStatus.FORBIDDEN,
+                    f"Rejected cross-origin POST from Origin: {origin_hdr!r}",
+                )
+
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         path = parsed.path
         try:
+            self._validate_post_host_and_origin()
             if path == "/api/lighting":
                 self._handle_post_lighting()
             elif path == "/api/underglow":

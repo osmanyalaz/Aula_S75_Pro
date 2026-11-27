@@ -6,4 +6,15 @@ venv/
 .mypy_cache/
 .ruff_cache/
 *.egg-info/
+build/
+dist/
+.coverage
+htmlcov/
+.env
+.env.*
+.vscode/
+.idea/
+*.swp
+*.swo
 .DS_Store
+Thumbs.db

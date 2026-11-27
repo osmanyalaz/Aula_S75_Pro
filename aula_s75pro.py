@@ -2,17 +2,15 @@
 aula_s75pro.py
 ==============
 
-Reverse-engineered control library for the AULA S75Pro keyboard driver protocol.
+Reverse-engineered control library for the AULA S75 Pro keyboard protocol
+across wired USB (0x0C45:0x800A) and the 2.4GHz wireless dongle (0x05AC:0x024F).
 
-Source material this was built from (all provided by the user):
-  - config.xml            -> VID/PID/interface identifiers, driver metadata
-  - rgb-keyboard.xml       -> full per-key layout (scan code / light_index / position)
-  - decomiledFromExe.txt  -> Ghidra decompilation snippets of the official Windows driver
-  - KeyResponseTimeLogs.txt / TimeToSleepLogs.txt
-                            -> tshark USB captures of the driver changing the
-                               "key response time" and "sleep timer" settings
+Built from USB/HID traffic captures, `lsusb` descriptors, and read-only
+analysis of the official Windows driver and keyboard MCU firmware v1.03
+(raw vendor binaries, XML configs, and captures are intentionally omitted
+from this repository).
 
-See PROTOCOL.md in this folder for the full write-up of what was verified vs. inferred.
+See PROTOCOL.md and FIRMWARE_AUDIT.md in this folder for full protocol details.
 """
 
 from __future__ import annotations
