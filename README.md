@@ -151,5 +151,5 @@ See [PROTOCOL.md](PROTOCOL.md) for the full reverse-engineered protocol, and [FI
   - *(On-board-only hardware controls in firmware `v1.03`: rotary encoder CW/CCW/press `0x00E9`/`0x00EA`/`0x00E2`, TFT screen language `0x2000023A` toggled on the keyboard LCD menu — `DeviceDriver.exe`'s Settings language dropdown only sets its own PC GUI `LCID`, OS layout mode `Fn+Q/W/E/R`, Row-5 accent bar `Fn+Z`, underglow static/breathing color `Fn+/?`, and full `Fn+Esc` factory reset have no USB/2.4G setter; `0x3804` full SPI flash write, the EP0 ISP bootloader magic sequence, and wireless `0x7F` / `0x80–0x8F` SPI streaming remain intentionally excluded for safety.)*
 
 ## Credits & License
-Reverse-engineered from USB captures of the official driver, its decompilation,
-and the keyboard MCU firmware. Licensed under the MIT License — see [LICENSE.md](LICENSE.md).
+Reverse-engineered from USB captures of the official driver, its decompilation, and the keyboard MCU firmware. Built with AI assistance for Ghidra analysis, implementation, and code auditing, with all active features verified on live S75 Pro hardware (firmware v1.03).
+Licensed under the MIT License — see [LICENSE.md](LICENSE.md).
